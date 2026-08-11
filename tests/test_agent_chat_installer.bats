@@ -86,6 +86,9 @@ setup() {
     FAKE_HOME="$(mktemp -d)"
     export PGPASS_FILE="$FAKE_HOME/.pgpass"
     export AGENT_CHAT_DB_NAME="agent_chat_chunk2_test_${BATS_TEST_NUMBER}_$$"
+    # Listener source is present in this repo, but tests should not start a
+    # real systemd user unit against the production agent_chat database.
+    export AGENT_CHAT_SKIP_LISTENER_UNIT=1
     # Create the per-test database so scripts that expect an existing bus can connect.
     createdb "$AGENT_CHAT_DB_NAME" >/dev/null 2>&1 || true
 }
@@ -150,6 +153,19 @@ teardown() {
     fi
     run shellcheck "$REPO_ROOT/lib/pg-env.sh"
     [ "$status" -eq 0 ]
+}
+
+@test "listener/pg-notify-listener-chat.py compiles with python3" {
+    run python3 -m py_compile "$REPO_ROOT/listener/pg-notify-listener-chat.py"
+    [ "$status" -eq 0 ]
+}
+
+@test "TC-29: installer skips listener unit when AGENT_CHAT_SKIP_LISTENER_UNIT=1" {
+    [ -f "$REPO_ROOT/listener/pg-notify-listener-chat.py" ]
+    [ -f "$REPO_ROOT/listener/pg-notify-listener-chat.service" ]
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"AGENT_CHAT_SKIP_LISTENER_UNIT=1; skipping listener unit installation"* ]]
 }
 
 # ─── install.sh (TC-01..09) ─────────────────────────────────────────────────
