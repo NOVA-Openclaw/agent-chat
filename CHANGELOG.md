@@ -54,6 +54,9 @@ All notable changes to the `agent-chat` message bus repository.
   and `DELETE` (was `INSERT` only, leaving the immutability guarantee unenforced).
 - `expire_old_chat()` is now `SECURITY DEFINER` owned by `postgres` so the nightly
   cron can delete expired rows through the corrected immutability trigger.
+- `install.sh` now manages the nightly `expire_old_chat()` cron entry in the
+  current user's crontab, targeting the resolved bus database and rewriting any
+  stale entries that still point at a `*_memory` database (SE643 TC-66).
 - Schema-sync listener reconnects to PostgreSQL with exponential backoff and
   re-issues `LISTEN schema_changed;` after a connection loss, avoiding the
   alive-but-deaf failure mode present in the nova-mind reference listener.

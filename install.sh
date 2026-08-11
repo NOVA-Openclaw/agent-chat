@@ -177,6 +177,54 @@ _detect_drift() {
   fi
 }
 
+# Nightly expire_old_chat cron -----------------------------------------------
+
+_EXPIRE_OLD_CHAT_MARKER="# agent-chat-expire-old-chat"
+_EXPIRE_OLD_CHAT_DEFAULT_SCHEDULE="30 3 * * *"
+
+_pick_expire_old_chat_schedule() {
+  # Preserve the schedule of an existing expire_old_chat entry if one exists;
+  # otherwise fall back to the default 03:30 nightly schedule.
+  local current_crontab
+  current_crontab=$(crontab -l 2>/dev/null || true)
+  local schedule
+  schedule=$(echo "$current_crontab" | awk '/expire_old_chat/{print $1" "$2" "$3" "$4" "$5; exit}')
+  printf '%s' "${schedule:-$_EXPIRE_OLD_CHAT_DEFAULT_SCHEDULE}"
+}
+
+_install_expire_old_chat_cron() {
+  if [ "${AGENT_CHAT_SKIP_CRON:-}" = "1" ]; then
+    echo -e "  ${INFO} AGENT_CHAT_SKIP_CRON=1; skipping expire_old_chat cron installation"
+    return 0
+  fi
+
+  local schedule
+  schedule=$(_pick_expire_old_chat_schedule)
+  local new_entry="$schedule psql -d \"$DB_NAME\" -c \"SELECT expire_old_chat();\" $_EXPIRE_OLD_CHAT_MARKER"
+
+  local current_crontab
+  current_crontab=$(crontab -l 2>/dev/null || true)
+
+  # Idempotent up-to-date check.
+  if echo "$current_crontab" | grep -qxF "$new_entry"; then
+    echo -e "  ${CHECK_MARK} expire_old_chat cron entry already up to date"
+    return 0
+  fi
+
+  # Drop any existing expire_old_chat line(s), including stale ones that target
+  # a different database (e.g. *_memory), then append the canonical entry.
+  local new_crontab
+  new_crontab=$(echo "$current_crontab" | grep -vF "expire_old_chat" || true)
+  if [ -n "$new_crontab" ]; then
+    new_crontab="${new_crontab}"$'\n'"$new_entry"
+  else
+    new_crontab="$new_entry"
+  fi
+
+  printf '%s\n' "$new_crontab" | crontab -
+  echo -e "  ${CHECK_MARK} Installed expire_old_chat cron entry ($schedule)"
+}
+
 # Listener systemd unit -------------------------------------------------------
 
 _install_listener_unit() {
@@ -266,6 +314,7 @@ main() {
     echo -e "  ${INFO} agent_chat bus is up to date (schema_version 3, all expected objects present)"
     _detect_drift "$DB_NAME"
     _install_listener_unit
+    _install_expire_old_chat_cron
     echo ""
     echo -e "${CHECK_MARK} agent_chat bus installer complete (no changes needed)"
     exit 0
@@ -275,6 +324,7 @@ main() {
   _apply_migrations "$DB_NAME"
   _detect_drift "$DB_NAME"
   _install_listener_unit
+  _install_expire_old_chat_cron
 
   echo ""
   echo -e "${CHECK_MARK} agent_chat bus installer complete"

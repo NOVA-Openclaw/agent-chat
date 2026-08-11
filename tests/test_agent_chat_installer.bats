@@ -91,6 +91,27 @@ setup() {
     export AGENT_CHAT_SKIP_LISTENER_UNIT=1
     # Create the per-test database so scripts that expect an existing bus can connect.
     createdb "$AGENT_CHAT_DB_NAME" >/dev/null 2>&1 || true
+
+    # Install a fake crontab shim so cron installation tests never touch the
+    # real user crontab of the test host.
+    CRONTAB_SHIM_DIR="$(mktemp -d)"
+    export CRONTAB_FILE="$CRONTAB_SHIM_DIR/crontab.txt"
+    cat > "$CRONTAB_SHIM_DIR/crontab" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = "-l" ]; then
+    if [ -f "$CRONTAB_FILE" ]; then cat "$CRONTAB_FILE"; fi
+    exit 0
+elif [ "${1:-}" = "-" ]; then
+    cat > "$CRONTAB_FILE"
+    exit 0
+else
+    echo "fake crontab: unsupported args $*" >&2
+    exit 1
+fi
+EOF
+    chmod +x "$CRONTAB_SHIM_DIR/crontab"
+    export PATH="$CRONTAB_SHIM_DIR:$PATH"
 }
 
 teardown() {
@@ -99,6 +120,9 @@ teardown() {
         psql -d postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
     fi
     rm -rf "$FAKE_HOME"
+    if [ -n "${CRONTAB_SHIM_DIR:-}" ]; then
+        rm -rf "$CRONTAB_SHIM_DIR"
+    fi
 }
 
 # ─── Static checks ──────────────────────────────────────────────────────────
@@ -166,6 +190,60 @@ teardown() {
     run "$INSTALLER"
     [ "$status" -eq 0 ]
     [[ "$output" == *"AGENT_CHAT_SKIP_LISTENER_UNIT=1; skipping listener unit installation"* ]]
+}
+
+# ─── expire_old_chat cron (TC-66) ───────────────────────────────────────────
+
+@test "TC-66: fresh install creates expire_old_chat cron entry targeting bus DB" {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+    [ -f "$CRONTAB_FILE" ]
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 1 ]
+    run grep -qxF "30 3 * * * psql -d \"$AGENT_CHAT_DB_NAME\" -c \"SELECT expire_old_chat();\" # agent-chat-expire-old-chat" "$CRONTAB_FILE"
+    [ "$status" -eq 0 ]
+}
+
+@test "TC-66: re-run is idempotent (no duplicate expire_old_chat entries)" {
+    "$INSTALLER" >/dev/null
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 1 ]
+    "$INSTALLER" >/dev/null
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 1 ]
+}
+
+@test "TC-66: stale *_memory-targeting expire_old_chat entry is rewritten" {
+    printf '%s\n' '30 4 * * * psql -d "nova_memory" -c "SELECT expire_old_chat();"' > "$CRONTAB_FILE"
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 1 ]
+    run grep -qF 'nova_memory' "$CRONTAB_FILE"
+    [ "$status" -ne 0 ]
+    run grep -qxF "30 4 * * * psql -d \"$AGENT_CHAT_DB_NAME\" -c \"SELECT expire_old_chat();\" # agent-chat-expire-old-chat" "$CRONTAB_FILE"
+    [ "$status" -eq 0 ]
+}
+
+@test "TC-66: unrelated crontab lines are preserved" {
+    printf '%s\n' '0 5 * * * echo hello' > "$CRONTAB_FILE"
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+    run grep -qxF "0 5 * * * echo hello" "$CRONTAB_FILE"
+    [ "$status" -eq 0 ]
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 1 ]
+}
+
+@test "TC-66: AGENT_CHAT_SKIP_CRON=1 skips cron installation" {
+    printf '%s\n' '0 5 * * * echo hello' > "$CRONTAB_FILE"
+    AGENT_CHAT_SKIP_CRON=1 run "$INSTALLER"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"AGENT_CHAT_SKIP_CRON=1; skipping expire_old_chat cron installation"* ]]
+    run grep -cF "expire_old_chat" "$CRONTAB_FILE"
+    [ "$output" -eq 0 ]
+    run grep -qxF "0 5 * * * echo hello" "$CRONTAB_FILE"
+    [ "$status" -eq 0 ]
 }
 
 # ─── install.sh (TC-01..09) ─────────────────────────────────────────────────
