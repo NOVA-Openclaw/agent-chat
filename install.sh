@@ -180,11 +180,16 @@ _detect_drift() {
 # Listener systemd unit -------------------------------------------------------
 
 _install_listener_unit() {
-  local listener_script="$SCRIPT_DIR/pg-notify-listener-chat.py"
-  local service_file="$SCRIPT_DIR/pg-notify-listener-chat.service"
+  local listener_script="$SCRIPT_DIR/listener/pg-notify-listener-chat.py"
+  local service_file="$SCRIPT_DIR/listener/pg-notify-listener-chat.service"
 
   if [ ! -f "$listener_script" ] || [ ! -f "$service_file" ]; then
-    echo -e "  ${INFO} Listener unit source not present (chunk 3 will ship it); skipping"
+    echo -e "  ${INFO} Listener unit source not present; skipping"
+    return 0
+  fi
+
+  if [ "${AGENT_CHAT_SKIP_LISTENER_UNIT:-}" = "1" ]; then
+    echo -e "  ${INFO} AGENT_CHAT_SKIP_LISTENER_UNIT=1; skipping listener unit installation"
     return 0
   fi
 

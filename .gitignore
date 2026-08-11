@@ -25,3 +25,5 @@ build/
 # Staging / temp
 /tmp/
 *.tmp
+__pycache__/
+.pytest_cache/
