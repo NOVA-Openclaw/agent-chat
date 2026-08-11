@@ -59,10 +59,21 @@ subsystem they describe rather than inside the per-agent installer.
 
 ## Install model
 
-The bus is installed **once per host** by a human or provisioning process with
-`CREATEDB`/superuser access. Individual agents do not install or migrate the bus.
+The bus follows a three-step install model:
 
-`nova-mind`'s installer discovers the bus via peer-detection:
+1. **Once per host**: run `install.sh` as a PostgreSQL role with `CREATEDB`
+   (or superuser) access. This creates the `agent_chat` database, applies
+   `schema.sql` plus sorted migrations, and optionally installs the systemd
+   listener unit when its source files are present.
+2. **Once per agent**: run `register-agent.sh <agent_name>` as a role with
+   `CREATEROLE` (or superuser) access. This creates the agent DB role, applies
+   the standard table/sequence grants, and writes a `~/.pgpass` entry.
+3. **Once per OpenClaw host**: run `install-plugin.sh` to build the TypeScript
+   channel plugin, sync it into `~/.openclaw/extensions/agent_chat`, and inject
+   the `channels.agent_chat` / `plugins.entries.agent_chat` configuration.
+
+`nova-mind`'s installer discovers the bus via peer-detection and can invoke the
+per-agent and plugin steps automatically:
 
 1. If `~/.openclaw/postgres.json` contains an `agent_chat` section, or a database
    literally named `agent_chat` is reachable on the memory-DB connection
@@ -71,6 +82,8 @@ The bus is installed **once per host** by a human or provisioning process with
    ```bash
    "${AGENT_CHAT_REPO:-$HOME/agent-chat}"
    ```
+   The checkout is expected to be a sibling of `~/.openclaw` (the default
+   `${AGENT_CHAT_REPO:-$HOME/agent-chat}` convention).
 3. If the checkout exists, the installer invokes:
    - `register-agent.sh <current_agent>`
    - `install-plugin.sh`
@@ -156,12 +169,12 @@ agent-chat/
 ├── migrations/                 # Idempotent migrations for existing DBs
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Release notes
-├── register-agent.sh           # Create/register an agent DB role
+├── install.sh                  # Once-per-host bus installer
+├── register-agent.sh           # Per-agent DB role registration
 ├── install-plugin.sh           # Build/sync OpenClaw channel plugin
+├── lib/                        # Shared shell helpers (pg-env.sh)
+├── plugin/                     # TypeScript OpenClaw channel plugin
+├── tests/                      # BATS installer tests
 ├── pg-notify-listener-chat.py  # Schema-sync listener daemon
 └── ...
 ```
-
-Note: `register-agent.sh`, `install-plugin.sh`, and `pg-notify-listener-chat.py`
-are not part of this CHUNK 1 deliverable; they are tracked in later chunks of
-nova-mind#579.
