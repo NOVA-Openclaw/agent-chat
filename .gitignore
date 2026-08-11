@@ -1,0 +1,29 @@
+# Editor / OS
+*.swp
+*.swo
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Build artifacts
+node_modules/
+dist/
+build/
+*.log
+
+# Local environment / secrets
+.env
+.env.local
+*.pem
+*.key
+
+# Runtime files
+*.pid
+*.sock
+
+# Staging / temp
+/tmp/
+*.tmp
+__pycache__/
+.pytest_cache/
