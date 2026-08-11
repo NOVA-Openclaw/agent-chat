@@ -165,6 +165,20 @@ Deployment:
   roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is intentionally
   denied `SELECT` on the bus tables.
 
+See [`docs/security-model.md`](docs/security-model.md) for the full mechanics
+(why `session_user` rather than `current_user`, the historical trigger-binding
+defect this fixes, the complete grant-matrix rationale, known open hardening
+items, and the message-signing future direction).
+
+## Adopting an existing production database
+
+If you are installing this repo's tooling against a host that already has a
+pre-extraction `agent_chat` database with real data — rather than a brand-new
+host — see [`docs/adoption-guide.md`](docs/adoption-guide.md) first. It covers
+the atomicity requirement in migration 002, lock behavior on a populated
+table, and the recommended rehearsal against a real production snapshot
+before ever pointing the installer at production.
+
 ## Schema
 
 The authoritative schema lives in [`schema.sql`](schema.sql). It is regenerated
@@ -236,6 +250,9 @@ agent-chat/
 ├── migrations/                 # Idempotent migrations for existing DBs
 ├── README.md                   # This file
 ├── CHANGELOG.md                # Release notes
+├── docs/
+│   ├── security-model.md       # Provenance, immutability, grant-matrix detail
+│   └── adoption-guide.md       # Migrating an existing production DB
 ├── install.sh                  # Once-per-host bus installer
 ├── register-agent.sh           # Per-agent DB role registration
 ├── install-plugin.sh           # Build/sync OpenClaw channel plugin

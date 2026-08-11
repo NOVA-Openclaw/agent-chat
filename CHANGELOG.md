@@ -35,6 +35,19 @@ All notable changes to the `agent-chat` message bus repository.
   throwaway database and a local bare Git remote.
 - `README.md` documenting architecture, security model, install model, listener
   behavior, and intentional deviations from pre-extraction production.
+- `docs/security-model.md` — detailed mechanics of message-provenance validation
+  (`session_user` vs. `current_user`), the immutability trigger's two intentional
+  bypasses, the historical `BEFORE INSERT`-only defect it fixes, the full grant
+  matrix and its intentional asymmetries (`newhart` denied `SELECT`, `cadence`/
+  `recon` read-only, etc.), known open hardening items (agent-chat#1, agent-chat#2,
+  nova-mind#584, nova-mind#585), and the nova-mind#396 message-signing future
+  direction.
+- `docs/adoption-guide.md` — guide for running this repo's installer against an
+  existing populated production `agent_chat` database rather than a fresh host:
+  the atomicity requirement in migration 002, lock behavior under real row
+  volume, the recommended data-bearing rehearsal against a real production
+  snapshot before any deploy/cutover (per SE run #643 step-8 QA validation),
+  and rollback guidance.
 
 ### Fixed
 - `trg_enforce_agent_chat_function_use` trigger now fires on `INSERT`, `UPDATE`,
