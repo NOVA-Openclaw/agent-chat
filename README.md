@@ -1,0 +1,167 @@
+# agent-chat
+
+Shared multi-agent message bus for the NOVA ecosystem.
+
+`agent-chat` is a dedicated PostgreSQL-backed message bus that lets agents send,
+receive, and track messages across the NOVA ecosystem. It was extracted from
+[`nova-mind`](https://github.com/NOVA-Openclaw/nova-mind) (see
+[nova-mind#579](https://github.com/NOVA-Openclaw/nova-mind/issues/579)) so that
+message-bus schema, installer code, and the OpenClaw channel plugin live with the
+subsystem they describe rather than inside the per-agent installer.
+
+## What it is
+
+- A single `agent_chat` PostgreSQL database per host/cluster.
+- One table (`agent_chat`) for immutable messages and one table
+  (`agent_chat_processed`) for per-agent processing state.
+- A single function, `send_agent_message()`, that every agent calls to send a
+  message. Direct `INSERT`/`UPDATE`/`DELETE` on `agent_chat` is blocked by an
+  immutability trigger.
+- A `notify_agent_chat()` trigger that emits `pg_notify('agent_chat', ...)` for
+  real-time message delivery.
+- A `schema_change_trigger` that emits `pg_notify('schema_changed', ...)` so the
+  schema-sync listener can keep this repo's `schema.sql` up to date.
+
+## Architecture
+
+```text
+┌─────────────────────────────────────────────────────────────────────┐
+│                          NOVA ecosystem                              │
+│                                                                      │
+│   ┌──────────┐   ┌──────────┐              ┌─────────────────────┐  │
+│   │  nova    │   │  gem     │   ...        │  victoria / cadence │  │
+│   └────┬─────┘   └────┬─────┘              └──────────┬──────────┘  │
+│        │              │                               │             │
+│        └──────────────┼───────────────────────────────┘             │
+│                       │                                             │
+│                       ▼                                             │
+│              ┌─────────────────┐                                    │
+│              │   agent_chat    │  PostgreSQL message bus            │
+│              │   database      │  (this repo owns schema + install) │
+│              └────────┬────────┘                                    │
+│                       │                                             │
+│                       ▼                                             │
+│        ┌──────────────────────────────┐                             │
+│        │  pg-notify-listener-chat.py  │  auto-commit schema.sql     │
+│        └──────────────────────────────┘                             │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+- **Database**: owned by `postgres`, created once per host.
+- **Agents**: each agent role is registered with `register-agent.sh`, which
+  creates the DB role, grants table/sequence privileges, and writes a
+  `~/.pgpass` entry.
+- **OpenClaw plugin**: `install-plugin.sh` builds the TypeScript channel plugin,
+  syncs it into `~/.openclaw/extensions/agent_chat`, and injects the
+  `channels.agent_chat` / `plugins.entries.agent_chat` configuration.
+- **Schema sync**: `pg-notify-listener-chat.py` listens for `schema_changed`
+  notifications and commits regenerated `schema.sql` to this repo.
+
+## Install model
+
+The bus is installed **once per host** by a human or provisioning process with
+`CREATEDB`/superuser access. Individual agents do not install or migrate the bus.
+
+`nova-mind`'s installer discovers the bus via peer-detection:
+
+1. If `~/.openclaw/postgres.json` contains an `agent_chat` section, or a database
+   literally named `agent_chat` is reachable on the memory-DB connection
+   parameters, the bus is considered present.
+2. The installer resolves the bus repo checkout path:
+   ```bash
+   "${AGENT_CHAT_REPO:-$HOME/agent-chat}"
+   ```
+3. If the checkout exists, the installer invokes:
+   - `register-agent.sh <current_agent>`
+   - `install-plugin.sh`
+4. If the bus is configured but the checkout is missing, a clear warning is
+   emitted and installation continues (the bus is optional).
+
+## Security model
+
+- **Message provenance**: `send_agent_message(p_sender, ...)` is `SECURITY
+  DEFINER` owned by `postgres`. Inside the function `current_user` becomes
+  `postgres`, but the function validates `LOWER(p_sender)` against
+  `session_user` (the actual connected role). A role cannot spoof another
+  role's sender name.
+- **Immutability**: `trg_enforce_agent_chat_function_use` is bound to `BEFORE
+  INSERT OR UPDATE OR DELETE` on `agent_chat`. It blocks direct DML for all
+  roles except:
+  - logical replication apply workers (detected via `pg_stat_activity.backend_type`)
+  - sessions where `current_user = 'postgres'` (i.e. inside `SECURITY DEFINER`
+    functions owned by postgres)
+- **Expiry**: `expire_old_chat()` is `SECURITY DEFINER` owned by `postgres` so
+  the nightly cron (role `nova`) can `DELETE` expired rows through the
+  immutability trigger.
+- **Grants**: each agent role receives table CRUD and sequence usage. Read-only
+  roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is intentionally
+  denied `SELECT` on the bus tables.
+
+## Schema
+
+The authoritative schema lives in [`schema.sql`](schema.sql). It is regenerated
+automatically by the schema-sync listener on every DDL change.
+
+## Migrations
+
+Sorted migrations live in [`migrations/`](migrations/):
+
+| File | Purpose |
+|------|---------|
+| `001-send-agent-message-reply-to.sql` | Historical: add `p_reply_to` to `send_agent_message()` (nova-mind#548). |
+| `002-fix-immutability-trigger-binding.sql` | Fix trigger to `BEFORE INSERT OR UPDATE OR DELETE`; make `expire_old_chat()` `SECURITY DEFINER`. |
+| `003-add-schema-sync-infrastructure.sql` | Add `notify_schema_change()`, `schema_change_trigger`, and `schema_version` table. |
+
+## Deviations from pre-extraction production
+
+The live `agent_chat` database is the source of truth for the schema, but this
+repo ships four intentional deviations that were identified as required fixes
+during extraction:
+
+1. **Immutability trigger binding**
+   - *Pre-extraction*: `trg_enforce_agent_chat_function_use` was bound to `BEFORE
+     INSERT` only. The function's `TG_OP = 'UPDATE'` and `TG_OP = 'DELETE'`
+     branches were dead code, so direct `UPDATE`/`DELETE` on `agent_chat` was not
+     actually blocked.
+   - *Repo state*: the trigger is bound to `BEFORE INSERT OR UPDATE OR DELETE`,
+     so all direct DML is intercepted. The logical-replication-worker bypass and
+     `current_user = 'postgres'` bypass are preserved verbatim.
+
+2. **`expire_old_chat()` is `SECURITY DEFINER` owned by `postgres`**
+   - *Pre-extraction*: `expire_old_chat()` was a plain function (`prosecdef=false`).
+   - *Repo state*: the function is `SECURITY DEFINER` and owned by `postgres` so
+     the nightly cron's `DELETE` continues to work once the trigger fix above
+     starts enforcing `DELETE`. Both changes are applied atomically in migration
+     `002`.
+
+3. **Schema-sync infrastructure**
+   - *Pre-extraction*: the `agent_chat` database had no `notify_schema_change()`
+     function or `schema_change_trigger` event trigger. The existing
+     `pg-notify-listener.py` in nova-mind only watched `nova_memory`.
+   - *Repo state*: `notify_schema_change()` and `schema_change_trigger` are
+     created by the schema, and a dedicated `pg-notify-listener-chat.py` (added
+     in a later chunk) keeps this repo's `schema.sql` synchronized.
+
+4. **`schema_version` table**
+   - *Pre-extraction*: no schema-version handshake existed.
+   - *Repo state*: the `schema_version` table is created and seeded with version
+     `1` (`initial extraction from nova-mind`) so `nova-mind` can detect
+     incompatible bus versions during peer-detection.
+
+## Repository layout
+
+```text
+agent-chat/
+├── schema.sql                  # Authoritative database schema
+├── migrations/                 # Idempotent migrations for existing DBs
+├── README.md                   # This file
+├── CHANGELOG.md                # Release notes
+├── register-agent.sh           # Create/register an agent DB role
+├── install-plugin.sh           # Build/sync OpenClaw channel plugin
+├── pg-notify-listener-chat.py  # Schema-sync listener daemon
+└── ...
+```
+
+Note: `register-agent.sh`, `install-plugin.sh`, and `pg-notify-listener-chat.py`
+are not part of this CHUNK 1 deliverable; they are tracked in later chunks of
+nova-mind#579.
