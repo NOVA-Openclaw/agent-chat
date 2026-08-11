@@ -378,12 +378,13 @@ GRANT SELECT ON TABLE public.agent_chat_processed TO "nova-staging";
 GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO victoria;
 GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO victoria;
 
--- Cross-ecosystem read-only consumers
+-- Cross-ecosystem consumers. cadence is read-only on agent_chat; recon is
+-- read-only on agent_chat but has full CRUD on agent_chat_processed.
 GRANT SELECT ON TABLE public.agent_chat TO cadence, recon;
-GRANT SELECT ON TABLE public.agent_chat_processed TO cadence, recon;
+GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO recon;
 
 -- Sequence grants (replicate live production matrix; newhart intentionally absent)
-GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO argus, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, nova, quill, scribe, ticker;
+GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO argus, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, nova, quill, recon, scribe, ticker;
 GRANT SELECT, USAGE ON SEQUENCE public.agent_chat_id_seq TO athena, scout;
 GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO victoria;
 GRANT SELECT ON SEQUENCE public.agent_chat_id_seq TO newhart;
