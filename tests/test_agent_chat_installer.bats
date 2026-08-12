@@ -192,6 +192,126 @@ teardown() {
     [[ "$output" == *"AGENT_CHAT_SKIP_LISTENER_UNIT=1; skipping listener unit installation"* ]]
 }
 
+# ─── expire_old_chat reap behavior (TC-04 regression / agent-chat#4) ────────
+
+@test "TC-04: expire_old_chat deletes messages that have agent_chat_processed rows" {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    # In a non-superuser test environment the SECURITY DEFINER functions are
+    # owned by the installing role, so the immutability trigger cannot be
+    # bypassed through current_user = 'postgres'. Disable the trigger for this
+    # test so we can exercise the FK path directly; the trigger itself is
+    # covered by TC-01/TC-02 and the schema function tests.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;"
+
+    # Insert an expired message directly. Use a timestamp in the past so it is
+    # immediately eligible for reaping (retention_days = 0).
+    local msg_id
+    # psql -At still prints the command tag after RETURNING, so take the first line.
+    msg_id=$(psql -d "$AGENT_CHAT_DB_NAME" -At -c "INSERT INTO public.agent_chat (sender, message, recipients, \"timestamp\", expires_at) VALUES ('nova', 'reap me', ARRAY['*'], now() - '1 day'::interval, now() - '1 day'::interval) RETURNING id;" | head -n 1)
+    [ -n "$msg_id" ]
+
+    # Simulate populated processing-state rows referencing the expiring message.
+    # This is the FK path that staging tests 16/0/2 and 31/32 failed to exercise.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "INSERT INTO public.agent_chat_processed (chat_id, agent, status) VALUES ($msg_id, 'nova', 'responded'), ($msg_id, 'graybeard', 'routed');"
+
+    # Reap must succeed and remove both the message and its processed-state rows.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT expire_old_chat(0);"
+    [ "$status" -eq 0 ]
+    [ "$output" -eq 1 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT COUNT(*) FROM public.agent_chat WHERE id = $msg_id;"
+    [ "$output" -eq 0 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT COUNT(*) FROM public.agent_chat_processed WHERE chat_id = $msg_id;"
+    [ "$output" -eq 0 ]
+}
+
+@test "TC-04: migration 004 is idempotent and leaves CASCADE FK validated" {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    # Re-apply migration 004 directly; must succeed without error.
+    run psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/004-expire-old-chat-processed-cascade.sql"
+    [ "$status" -eq 0 ]
+
+    # FK must be ON DELETE CASCADE and VALIDATED.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT confdeltype FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "c" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "t" ]
+}
+
+@test "TC-04: migration 004 cleans up orphaned processed rows and validates CASCADE FK" {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    # Disable the immutability trigger so tests can set up synthetic parent rows
+    # directly. send_agent_message() is SECURITY DEFINER owned by postgres in
+    # production, but in these non-superuser tests the installing role owns it,
+    # so direct DML is otherwise blocked.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;"
+
+    # Insert parent messages with fixed IDs and bump the sequence so later
+    # installer/bootstrap inserts cannot collide with these rows.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
+         VALUES (1000, 'nova', 'parent 1', ARRAY['*'], now()),
+                (1001, 'nova', 'parent 2', ARRAY['*'], now());
+         SELECT setval('public.agent_chat_id_seq', 2000);"
+
+    # Insert processed-state rows for the existing parents.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "INSERT INTO public.agent_chat_processed (chat_id, agent, status)
+         VALUES (1000, 'nova', 'responded'),
+                (1000, 'graybeard', 'routed'),
+                (1001, 'nova', 'responded');"
+
+    # Drop the FK to simulate the production window in which parent deletions
+    # and bogus processed rows were not constrained. This is the only reliable
+    # way to create orphan rows in PostgreSQL: remove the constraint, delete
+    # the parent/insert bogus children, then re-add it as NOT VALID (which
+    # skips validation of the already-orphaned rows).
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER TABLE public.agent_chat_processed DROP CONSTRAINT IF EXISTS agent_chat_processed_chat_id_fkey;
+         DELETE FROM public.agent_chat WHERE id = 1001;
+         INSERT INTO public.agent_chat_processed (chat_id, agent, status)
+             VALUES (2000, 'nova', 'responded'),
+                    (2001, 'graybeard', 'routed');
+         ALTER TABLE public.agent_chat_processed ADD CONSTRAINT agent_chat_processed_chat_id_fkey
+             FOREIGN KEY (chat_id) REFERENCES public.agent_chat (id) NOT VALID;"
+
+    # Re-apply migration 004. It must delete the three orphans, validate the
+    # new CASCADE FK, and leave the two valid rows for chat_id 1000 intact.
+    run psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/004-expire-old-chat-processed-cascade.sql"
+    [ "$status" -eq 0 ]
+
+    # No orphans remain.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT COUNT(*) FROM public.agent_chat_processed WHERE chat_id NOT IN (SELECT id FROM public.agent_chat);"
+    [ "$output" -eq 0 ]
+
+    # Valid processed rows for the surviving parent are preserved.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT COUNT(*) FROM public.agent_chat_processed WHERE chat_id = 1000;"
+    [ "$output" -eq 2 ]
+
+    # FK is now ON DELETE CASCADE and VALIDATED.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT confdeltype FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "c" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "t" ]
+}
+
 # ─── expire_old_chat cron (TC-66) ───────────────────────────────────────────
 
 @test "TC-66: fresh install creates expire_old_chat cron entry targeting bus DB" {
@@ -253,11 +373,11 @@ teardown() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"Applied schema.sql"* ]]
     [[ "$output" == *"Applied 001"* ]]
-    [[ "$output" == *"Applied 003"* ]]
+    [[ "$output" == *"Applied 004"* ]]
 
     # Verify schema_version.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "3" ]
+    [ "$output" = "4" ]
 
     # Verify core objects.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"
