@@ -86,8 +86,11 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_processed (
 
 -- FK to agent_chat is intentionally NOT VALID to match the live production
 -- schema state (nova-mind#475 drift). It is still enforced for new rows.
+-- ON DELETE CASCADE: processed-state rows are meaningless once the parent
+-- message is deleted, and expire_old_chat() must be able to reap old messages
+-- that have processing state (agent-chat#4).
 ALTER TABLE public.agent_chat_processed DROP CONSTRAINT IF EXISTS agent_chat_processed_chat_id_fkey;
-ALTER TABLE public.agent_chat_processed ADD CONSTRAINT agent_chat_processed_chat_id_fkey FOREIGN KEY (chat_id) REFERENCES public.agent_chat (id) NOT VALID;
+ALTER TABLE public.agent_chat_processed ADD CONSTRAINT agent_chat_processed_chat_id_fkey FOREIGN KEY (chat_id) REFERENCES public.agent_chat (id) ON DELETE CASCADE NOT VALID;
 
 COMMENT ON TABLE public.agent_chat_processed IS 'Message processing state. Agents can track, Newhart manages.';
 

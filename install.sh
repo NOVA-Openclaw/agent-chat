@@ -285,8 +285,8 @@ _is_up_to_date() {
   local db_name="$1"
   local version
   version="$(_get_installed_version "$db_name")"
-  # schema_version is seeded to 1 by schema.sql and advanced to 3 by migrations.
-  [ "$version" = "3" ]
+  # schema_version is seeded to 1 by schema.sql and advanced to 4 by migrations.
+  [ "$version" = "4" ]
 }
 
 # Main ------------------------------------------------------------------------
