@@ -229,7 +229,7 @@ teardown() {
     [ "$output" -eq 0 ]
 }
 
-@test "TC-04: migration 004 is idempotent and preserves NOT VALID" {
+@test "TC-04: migration 004 is idempotent and leaves CASCADE FK validated" {
     run "$INSTALLER"
     [ "$status" -eq 0 ]
 
@@ -237,14 +237,79 @@ teardown() {
     run psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/004-expire-old-chat-processed-cascade.sql"
     [ "$status" -eq 0 ]
 
-    # FK must still be NOT VALID and have ON DELETE CASCADE.
+    # FK must be ON DELETE CASCADE and VALIDATED.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
         "SELECT confdeltype FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
     [ "$output" = "c" ]
 
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
         "SELECT convalidated FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
-    [ "$output" = "f" ]
+    [ "$output" = "t" ]
+}
+
+@test "TC-04: migration 004 cleans up orphaned processed rows and validates CASCADE FK" {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    # Disable the immutability trigger so tests can set up synthetic parent rows
+    # directly. send_agent_message() is SECURITY DEFINER owned by postgres in
+    # production, but in these non-superuser tests the installing role owns it,
+    # so direct DML is otherwise blocked.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;"
+
+    # Insert parent messages with fixed IDs and bump the sequence so later
+    # installer/bootstrap inserts cannot collide with these rows.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
+         VALUES (1000, 'nova', 'parent 1', ARRAY['*'], now()),
+                (1001, 'nova', 'parent 2', ARRAY['*'], now());
+         SELECT setval('public.agent_chat_id_seq', 2000);"
+
+    # Insert processed-state rows for the existing parents.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "INSERT INTO public.agent_chat_processed (chat_id, agent, status)
+         VALUES (1000, 'nova', 'responded'),
+                (1000, 'graybeard', 'routed'),
+                (1001, 'nova', 'responded');"
+
+    # Drop the FK to simulate the production window in which parent deletions
+    # and bogus processed rows were not constrained. This is the only reliable
+    # way to create orphan rows in PostgreSQL: remove the constraint, delete
+    # the parent/insert bogus children, then re-add it as NOT VALID (which
+    # skips validation of the already-orphaned rows).
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c \
+        "ALTER TABLE public.agent_chat_processed DROP CONSTRAINT IF EXISTS agent_chat_processed_chat_id_fkey;
+         DELETE FROM public.agent_chat WHERE id = 1001;
+         INSERT INTO public.agent_chat_processed (chat_id, agent, status)
+             VALUES (2000, 'nova', 'responded'),
+                    (2001, 'graybeard', 'routed');
+         ALTER TABLE public.agent_chat_processed ADD CONSTRAINT agent_chat_processed_chat_id_fkey
+             FOREIGN KEY (chat_id) REFERENCES public.agent_chat (id) NOT VALID;"
+
+    # Re-apply migration 004. It must delete the three orphans, validate the
+    # new CASCADE FK, and leave the two valid rows for chat_id 1000 intact.
+    run psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/004-expire-old-chat-processed-cascade.sql"
+    [ "$status" -eq 0 ]
+
+    # No orphans remain.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT COUNT(*) FROM public.agent_chat_processed WHERE chat_id NOT IN (SELECT id FROM public.agent_chat);"
+    [ "$output" -eq 0 ]
+
+    # Valid processed rows for the surviving parent are preserved.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT COUNT(*) FROM public.agent_chat_processed WHERE chat_id = 1000;"
+    [ "$output" -eq 2 ]
+
+    # FK is now ON DELETE CASCADE and VALIDATED.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT confdeltype FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "c" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c \
+        "SELECT convalidated FROM pg_constraint WHERE conname = 'agent_chat_processed_chat_id_fkey';"
+    [ "$output" = "t" ]
 }
 
 # ─── expire_old_chat cron (TC-66) ───────────────────────────────────────────
