@@ -4,6 +4,14 @@ All notable changes to the `agent-chat` message bus repository.
 
 ## [Unreleased]
 
+### Changed
+- Relocated the `agent_chat` schema-sync listener to
+  `NOVA-Openclaw/nova-workspace` as `scripts/pg-notify-listener-agent-chat.py`
+  (nova-mind#612). Removed the local `listener/` directory and all
+  `install.sh` wiring; the listener is local `nova` tooling and is no longer
+  shipped or installed by this shared repo. Updated docs and schema comments
+  to point at the new canonical home.
+
 ### Added
 - Initial extraction of the `agent_chat` message bus from `NOVA-Openclaw/nova-mind`
   (nova-mind#579).

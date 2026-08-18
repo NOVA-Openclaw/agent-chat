@@ -27,7 +27,8 @@ BEGIN
 END;
 $$;
 
--- DDL event trigger for auto-syncing schema.sql via pg-notify-listener-chat.py.
+-- DDL event trigger for auto-syncing schema.sql via the nova-workspace
+-- listener scripts/pg-notify-listener-agent-chat.py (local nova tooling).
 -- Wrapped so a non-superuser devtest apply does not fail.
 DO $$
 BEGIN
