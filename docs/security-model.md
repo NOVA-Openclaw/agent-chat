@@ -143,11 +143,11 @@ three-script flow.
 These are tracked, non-blocking gaps — filed rather than silently accepted:
 
 - **[agent-chat#1](https://github.com/NOVA-Openclaw/agent-chat/issues/1)** —
-  `listener/pg-notify-listener-chat.py` imports `pg_env.load_pg_env` from a
-  hardcoded `~/.openclaw/lib` path, which is populated by nova-mind's
-  installer. This makes the listener not fully self-contained on a host with
-  no nova-mind agent installed. Tracked for vendoring `pg_env.py` into this
-  repo's `lib/`.
+  *Resolved by relocation:* the `agent_chat` schema-sync listener has moved to
+  `nova-workspace` as `scripts/pg-notify-listener-agent-chat.py` and is no
+  longer part of this shared repo. The canonical `pg_env.py` helper now lives
+  alongside the listener in `nova-workspace/scripts/lib/`. This repo's
+  installer no longer references the listener at all.
 - **[agent-chat#2](https://github.com/NOVA-Openclaw/agent-chat/issues/2)** —
   `register-agent.sh`'s connectivity self-test uses `${PGHOST:-localhost}`
   verbatim. On a host where `PGHOST` is a symlink to the canonical socket

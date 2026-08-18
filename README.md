@@ -38,12 +38,10 @@ subsystem they describe rather than inside the per-agent installer.
 │              ┌─────────────────┐                                    │
 │              │   agent_chat    │  PostgreSQL message bus            │
 │              │   database      │  (this repo owns schema + install) │
-│              └────────┬────────┘                                    │
-│                       │                                             │
-│                       ▼                                             │
-│        ┌──────────────────────────────┐                             │
-│        │  pg-notify-listener-chat.py  │  auto-commit schema.sql     │
-│        └──────────────────────────────┘                             │
+│              └─────────────────┘                                    │
+│                                                                     │
+│   The schema-sync listener lives in nova-workspace (local nova      │
+│   tooling) and is intentionally not part of this shared repo.       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,18 +52,18 @@ subsystem they describe rather than inside the per-agent installer.
 - **OpenClaw plugin**: `install-plugin.sh` builds the TypeScript channel plugin,
   syncs it into `~/.openclaw/extensions/agent_chat`, and injects the
   `channels.agent_chat` / `plugins.entries.agent_chat` configuration.
-- **Schema sync**: `listener/pg-notify-listener-chat.py` listens for
-  `schema_changed` notifications and commits regenerated `schema.sql` to this
-  repo. It is installed as a systemd user unit by `install.sh`.
+- **Schema sync**: the `agent_chat` schema-sync listener is local `nova`
+  tooling maintained in [`nova-workspace`](https://github.com/NOVA-Openclaw/nova-workspace)
+  (see `scripts/pg-notify-listener-agent-chat.py`). It is deliberately not
+  shipped or installed by this shared repo.
 
 ## Install model
 
 The bus follows a three-step install model:
 
 1. **Once per host**: run `install.sh` as a PostgreSQL role with `CREATEDB`
-   (or superuser) access. This creates the `agent_chat` database, applies
-   `schema.sql` plus sorted migrations, and optionally installs the systemd
-   listener unit when its source files are present.
+   (or superuser) access. This creates the `agent_chat` database and applies
+   `schema.sql` plus sorted migrations.
 2. **Once per agent**: run `register-agent.sh <agent_name>` as a role with
    `CREATEROLE` (or superuser) access. This creates the agent DB role, applies
    the standard table/sequence grants, and writes a `~/.pgpass` entry.
@@ -93,57 +91,11 @@ per-agent and plugin steps automatically:
 
 ## Schema-sync listener
 
-`listener/pg-notify-listener-chat.py` is a dedicated, lightweight daemon that
-keeps the repo's `schema.sql` synchronized with the live `agent_chat` database.
-
-What it does:
-
-1. Connects to the `agent_chat` database using credentials from
-   `~/.openclaw/postgres.json` (the `agent_chat` section is preferred; host/port
-   fall back to flat keys).
-2. Issues `LISTEN schema_changed;` and waits for DDL event-trigger notifications.
-3. Debounces rapid notifications with a 30-second window and deduplicates by
-   `(command_tag, object_identity)`.
-4. On a qualifying notification it dumps the current schema with `pgschema`,
-   writes it to `${AGENT_CHAT_REPO}/schema.sql`, runs `git add`/`git commit`
-   (`schema: <command> <object>`), and pushes to `origin/main` with
-   `OPENCLAW_AGENT_ID=gidget` so the protected-branch hook allows the mechanical
-   push.
-5. If the push fails, it classifies the failure (`auth`, `non-fast-forward`,
-   `transient`) and alerts `nova` (or `graybeard` if the listener itself is
-   `nova`) via `send_agent_message()` on the bus.
-
-Safety machinery carried over from the nova-mind reference listener:
-
-- An exclusive non-blocking file lock at
-  `~/.openclaw/workspace/scripts/.pg-notify-git-chat.lock` prevents concurrent
-  syncs from colliding with each other or with the nova-mind listener (which
-  uses a different lock path).
-- `_ensure_on_main()` verifies the checkout is on `main`; if it is on another
-  branch or has a dirty working tree it stashes, checks out `main`, fetches
-  origin, and fast-forwards. Divergence alerts and aborts rather than forcing a
-  merge.
-- Push failures are classified: auth and non-fast-forward alert immediately
-  without retry; transient failures retry with exponential backoff.
-- Alert recipients avoid self-address: if the listener connects as `nova`, the
-  alert is routed to `graybeard`.
-
-Reconnect behavior:
-
-- The daemon reconnects to PostgreSQL with exponential backoff (capped at 60s)
-  both on startup and whenever the connection is lost in the main loop. After a
-  reconnect it re-issues `LISTEN schema_changed;`.
-- This is an intentional improvement over the nova-mind reference listener,
-  which could reuse a dead connection after a Postgres restart.
-
-Deployment:
-
-- `install.sh` copies `listener/pg-notify-listener-chat.py` to
-  `~/.openclaw/scripts/` and `listener/pg-notify-listener-chat.service` to
-  `~/.config/systemd/user/`, then enables+starts (or restarts) the unit.
-- Set `AGENT_CHAT_REPO` to override the default repo path (`$HOME/agent-chat`).
-- Set `AGENT_CHAT_SKIP_LISTENER_UNIT=1` to skip unit installation (used by the
-  test suite to avoid touching the live systemd user session).
+The `agent_chat` schema-sync listener is local `nova` tooling maintained in
+[`nova-workspace`](https://github.com/NOVA-Openclaw/nova-workspace) as
+`scripts/pg-notify-listener-agent-chat.py`. It is intentionally **not** part of
+the shared `agent-chat` distribution or its installer. See `nova-workspace` for
+listener behavior, deployment, and safety machinery.
 
 ## Security model
 
@@ -182,7 +134,8 @@ before ever pointing the installer at production.
 ## Schema
 
 The authoritative schema lives in [`schema.sql`](schema.sql). It is regenerated
-automatically by the schema-sync listener on every DDL change.
+automatically by the schema-sync listener (`pg-notify-listener-agent-chat.py`
+in `nova-workspace`) on every DDL change.
 
 ## Migrations
 
@@ -221,8 +174,10 @@ during extraction:
      function or `schema_change_trigger` event trigger. The existing
      `pg-notify-listener.py` in nova-mind only watched `nova_memory`.
    - *Repo state*: `notify_schema_change()` and `schema_change_trigger` are
-     created by the schema, and a dedicated `pg-notify-listener-chat.py` (added
-     in a later chunk) keeps this repo's `schema.sql` synchronized.
+     created by the schema. The listener that keeps this repo's `schema.sql`
+     synchronized is local `nova` tooling in `nova-workspace`
+     (`scripts/pg-notify-listener-agent-chat.py`) and is not shipped with this
+     shared repo.
 
 4. **`schema_version` table**
    - *Pre-extraction*: no schema-version handshake existed.
@@ -235,12 +190,12 @@ during extraction:
      broad `Exception` in its main loop, sleeps 5s, and continues polling the
      same `conn`, so it stays deaf after a PostgreSQL restart until the process
      is restarted.
-   - *Repo state*: `pg-notify-listener-chat.py` detects closed/dead connections
-     (`conn.closed`, `OperationalError`, `InterfaceError`, `OSError`), closes
-     the old connection, reconnects with exponential backoff capped at 60s, and
-     re-issues `LISTEN schema_changed;`. This fix is intentionally scoped to the
-     new agent-chat listener; porting it back to nova-mind is out of scope for
-     nova-mind#579.
+   - *Repo state*: the listener that watches `agent_chat` schema changes is now
+     local `nova` tooling in `nova-workspace`
+     (`scripts/pg-notify-listener-agent-chat.py`). It detects closed/dead
+     connections (`conn.closed`, `OperationalError`, `InterfaceError`,
+     `OSError`), closes the old connection, reconnects with exponential backoff
+     capped at 60s, and re-issues `LISTEN schema_changed;`.
 
 ## Repository layout
 
@@ -258,9 +213,6 @@ agent-chat/
 ├── install-plugin.sh           # Build/sync OpenClaw channel plugin
 ├── lib/                        # Shared shell helpers (pg-env.sh)
 ├── plugin/                     # TypeScript OpenClaw channel plugin
-├── tests/                      # BATS installer tests + pytest listener tests
-├── listener/                   # Schema-sync listener daemon
-│   ├── pg-notify-listener-chat.py
-│   └── pg-notify-listener-chat.service
+├── tests/                      # BATS installer tests
 └── ...
 ```

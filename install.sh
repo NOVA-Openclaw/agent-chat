@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # install.sh — once-per-host installer for the agent_chat message bus.
 #
-# Creates the agent_chat database (name configurable via AGENT_CHAT_DB_NAME),
-# applies schema.sql + sorted migrations, and optionally installs the systemd
-# listener unit when present. Idempotent and crash-recoverable.
+# Creates the agent_chat database (name configurable via AGENT_CHAT_DB_NAME)
+# and applies schema.sql + sorted migrations. Idempotent and crash-recoverable.
 
 set -euo pipefail
 
@@ -225,55 +224,6 @@ _install_expire_old_chat_cron() {
   echo -e "  ${CHECK_MARK} Installed expire_old_chat cron entry ($schedule)"
 }
 
-# Listener systemd unit -------------------------------------------------------
-
-_install_listener_unit() {
-  local listener_script="$SCRIPT_DIR/listener/pg-notify-listener-chat.py"
-  local service_file="$SCRIPT_DIR/listener/pg-notify-listener-chat.service"
-
-  if [ ! -f "$listener_script" ] || [ ! -f "$service_file" ]; then
-    echo -e "  ${INFO} Listener unit source not present; skipping"
-    return 0
-  fi
-
-  if [ "${AGENT_CHAT_SKIP_LISTENER_UNIT:-}" = "1" ]; then
-    echo -e "  ${INFO} AGENT_CHAT_SKIP_LISTENER_UNIT=1; skipping listener unit installation"
-    return 0
-  fi
-
-  local target_dir="${HOME}/.openclaw/scripts"
-  local service_dir="${HOME}/.config/systemd/user"
-  local logs_dir="${HOME}/.openclaw/logs"
-  mkdir -p "$target_dir" "$service_dir" "$logs_dir"
-
-  cp "$listener_script" "$target_dir/pg-notify-listener-chat.py"
-  chmod +x "$target_dir/pg-notify-listener-chat.py"
-  echo -e "  ${CHECK_MARK} Installed pg-notify-listener-chat.py → $target_dir"
-
-  cp "$service_file" "$service_dir/pg-notify-listener-chat.service"
-  echo -e "  ${CHECK_MARK} Installed pg-notify-listener-chat.service → $service_dir"
-
-  if command -v systemctl &>/dev/null; then
-    systemctl --user daemon-reload
-    if systemctl --user is-active pg-notify-listener-chat.service &>/dev/null; then
-      if systemctl --user restart pg-notify-listener-chat.service; then
-        echo -e "  ${CHECK_MARK} Restarted pg-notify-listener-chat.service"
-      else
-        echo -e "  ${WARNING} pg-notify-listener-chat.service restart failed"
-      fi
-    else
-      if systemctl --user enable pg-notify-listener-chat.service &>/dev/null && \
-         systemctl --user start pg-notify-listener-chat.service; then
-        echo -e "  ${CHECK_MARK} Enabled and started pg-notify-listener-chat.service"
-      else
-        echo -e "  ${WARNING} pg-notify-listener-chat.service enable/start failed"
-      fi
-    fi
-  else
-    echo -e "  ${WARNING} systemctl not available — listener service not started"
-  fi
-}
-
 # Schema-version / idempotency checks -----------------------------------------
 
 _get_installed_version() {
@@ -313,7 +263,6 @@ main() {
   if [ "$db_existed" -eq 1 ] && _is_up_to_date "$DB_NAME"; then
     echo -e "  ${INFO} agent_chat bus is up to date (schema_version 3, all expected objects present)"
     _detect_drift "$DB_NAME"
-    _install_listener_unit
     _install_expire_old_chat_cron
     echo ""
     echo -e "${CHECK_MARK} agent_chat bus installer complete (no changes needed)"
@@ -323,7 +272,6 @@ main() {
   _apply_schema "$DB_NAME"
   _apply_migrations "$DB_NAME"
   _detect_drift "$DB_NAME"
-  _install_listener_unit
   _install_expire_old_chat_cron
 
   echo ""

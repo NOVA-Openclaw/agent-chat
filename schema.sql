@@ -4,9 +4,10 @@
 -- Issue lineage: nova-mind#320 (standalone bus), nova-mind#579 (extraction to dedicated repo)
 --
 -- This file is the AUTHORITATIVE schema for the agent_chat message bus.
--- It is kept in sync with the live database by pg-notify-listener-chat.py,
--- which commits the output of `pgschema dump --db agent_chat` after every
--- schema-changing DDL statement.
+-- It is kept in sync with the live database by the nova-workspace listener
+-- scripts/pg-notify-listener-agent-chat.py (local nova tooling), which commits
+-- the output of `pgschema dump --db agent_chat` after every schema-changing DDL
+-- statement.
 --
 -- Design decisions (authoritative, 2026-08-11):
 --   * PostgreSQL-backed, once-per-host install model. The bus is optional for
