@@ -235,8 +235,9 @@ _is_up_to_date() {
   local db_name="$1"
   local version
   version="$(_get_installed_version "$db_name")"
-  # schema_version is seeded to 1 by schema.sql and advanced to 4 by migrations.
-  [ "$version" = "4" ]
+  # schema_version is seeded to 1 by schema.sql and advanced to 5 by migrations
+  # (agent-chat#11: courtesy-reply-storm circuit breaker).
+  [ "$version" = "5" ]
 }
 
 # Main ------------------------------------------------------------------------
@@ -261,7 +262,7 @@ main() {
   fi
 
   if [ "$db_existed" -eq 1 ] && _is_up_to_date "$DB_NAME"; then
-    echo -e "  ${INFO} agent_chat bus is up to date (schema_version 3, all expected objects present)"
+    echo -e "  ${INFO} agent_chat bus is up to date (schema_version 5, all expected objects present)"
     _detect_drift "$DB_NAME"
     _install_expire_old_chat_cron
     echo ""

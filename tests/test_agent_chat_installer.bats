@@ -112,10 +112,27 @@ EOF
 }
 
 teardown() {
-    # Drop any test database created by this test.
+    # Drop any test database created by this test FIRST. TC-11x helper roles
+    # (below) hold GRANTs inside this database; PostgreSQL refuses DROP ROLE
+    # while a role still has privileges granted on live objects, so the
+    # database must go before the roles that were granted access to it.
     if [ -n "${AGENT_CHAT_DB_NAME:-}" ]; then
         psql -d postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
     fi
+
+    # TC-11x helper roles: drop unconditionally in the global teardown (not
+    # inline at the end of each test body) so a failed assertion mid-test
+    # still cleans up the roles instead of leaking them.
+    if [ -n "${_TC11X_ROLE_A:-}" ]; then
+        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_A\";" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${_TC11X_ROLE_B:-}" ]; then
+        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_B\";" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${_TC11X_PGPASSFILE:-}" ]; then
+        rm -f "$_TC11X_PGPASSFILE"
+    fi
+
     rm -rf "$FAKE_HOME"
     if [ -n "${CRONTAB_SHIM_DIR:-}" ]; then
         rm -rf "$CRONTAB_SHIM_DIR"
@@ -296,6 +313,216 @@ teardown() {
     [ "$output" = "t" ]
 }
 
+# ─── courtesy-reply storm circuit breaker (TC-11x / agent-chat#11) ─────────
+#
+# These tests exercise the live send_agent_message() function directly
+# (rather than through install.sh) against a per-test database, using two
+# ephemeral login roles so that p_sender/session_user validation reflects
+# real distinct agents exchanging messages, the same way nova/graybeard do in
+# production.
+
+_TC11X_ROLE_A=""
+_TC11X_ROLE_B=""
+_TC11X_PGPASSFILE=""
+
+_tc11x_setup_roles_and_schema() {
+    run "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    _TC11X_ROLE_A="zz11a_${BATS_TEST_NUMBER}_$$"
+    _TC11X_ROLE_B="zz11b_${BATS_TEST_NUMBER}_$$"
+    psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_A\" LOGIN PASSWORD 'tc11xpw';"
+    psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_B\" LOGIN PASSWORD 'tc11xpw';"
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_state, public.agent_chat_suppressed_log TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
+
+    _TC11X_PGPASSFILE="$(mktemp)"
+    chmod 600 "$_TC11X_PGPASSFILE"
+    {
+        echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_A}:tc11xpw"
+        echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_B}:tc11xpw"
+    } > "$_TC11X_PGPASSFILE"
+}
+
+# Role/pgpass cleanup happens unconditionally in the global teardown() above
+# (not here) so a failed assertion mid-test still cleans up.
+
+# Send as role A (session_user == p_sender == role A) to the given recipient.
+_tc11x_send_as_a() {
+    local recipient="$1" message="$2"
+    PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -At \
+        -c "SELECT send_agent_message('${_TC11X_ROLE_A}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
+}
+
+_tc11x_send_as_b() {
+    local recipient="$1" message="$2"
+    PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_B" -d "$AGENT_CHAT_DB_NAME" -At \
+        -c "SELECT send_agent_message('${_TC11X_ROLE_B}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
+}
+
+@test "TC-110: sender-side filter quarantines the occurrence 2/3 runtime-error template" {
+    _tc11x_setup_roles_and_schema
+
+    run _tc11x_send_as_a "$_TC11X_ROLE_B" "⚠️ Something went wrong while processing your request. Please try again, or use /compact."
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]   # NULL id: silent on the bus
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}';"
+    [ "$output" = "0" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT reason FROM agent_chat_suppressed_log WHERE sender = '${_TC11X_ROLE_A}';"
+    [ "$output" = "sender_filter_error_template" ]
+
+}
+
+@test "TC-111: sender-side filter also quarantines the occurrence 4 saturation/compaction templates" {
+    _tc11x_setup_roles_and_schema
+
+    run _tc11x_send_as_a "$_TC11X_ROLE_B" "⚠️ Context is too large and auto-compaction could not recover this turn. Try again, use /compact, or use /new to start a fresh session."
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    run _tc11x_send_as_b "$_TC11X_ROLE_A" "The context is saturated and cannot process turns — /compact or /new is genuinely required to recover this session. Nothing actionable in a compaction-failure notice."
+    [ "$status" -eq 0 ]
+    [ -z "$output" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat;"
+    [ "$output" = "0" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_suppressed_log WHERE reason = 'sender_filter_error_template';"
+    [ "$output" = "2" ]
+
+}
+
+@test "TC-112: ordinary non-template messages are unaffected by the sender-side filter" {
+    _tc11x_setup_roles_and_schema
+
+    run _tc11x_send_as_a "$_TC11X_ROLE_B" "Can you take a look at agent-chat#11 when you get a chance?"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]   # got a real id back
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}';"
+    [ "$output" = "1" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_suppressed_log;"
+    [ "$output" = "0" ]
+
+}
+
+@test "TC-113: A->B->A->B non-substantive exchange trips the loop breaker and damps the storm" {
+    _tc11x_setup_roles_and_schema
+
+    # Reproduce the loop condition: 12 alternating, non-substantive messages
+    # with no artifact reference (mirrors the occurrence-4 mutual-saturation
+    # ladder — neither body references an issue/PR/task/file).
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "No reply. Note $i concludes nothing needs action." >/dev/null
+        _tc11x_send_as_b "$_TC11X_ROLE_A" "A runtime status notice, no content to act on ($i)." >/dev/null
+    done
+
+    # Both directions must have stopped growing at the threshold (5 delivered,
+    # 6th+ suppressed) rather than reaching all 6 sent attempts.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}' AND recipients = ARRAY['${_TC11X_ROLE_B}'];"
+    [ "$output" -lt 6 ]
+    [ "$output" -ge 1 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_B}' AND recipients = ARRAY['${_TC11X_ROLE_A}'];"
+    [ "$output" -lt 6 ]
+    [ "$output" -ge 1 ]
+
+    # Both ordered pairs must show tripped = true with at least one suppression.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_B}' AND recipient = '${_TC11X_ROLE_A}';"
+    [ "$output" = "t" ]
+
+    # Exactly one loop_breaker audit row per direction (loud once, not per
+    # suppressed message — a live storm cannot flood this table).
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_suppressed_log WHERE reason = 'loop_breaker';"
+    [ "$output" = "2" ]
+
+}
+
+@test "TC-114: a message referencing a new artifact resets the breaker and is delivered" {
+    _tc11x_setup_roles_and_schema
+
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "No reply. Note $i concludes nothing needs action." >/dev/null
+    done
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+
+    # A message referencing a real artifact must reset the pair and be delivered.
+    run _tc11x_send_as_a "$_TC11X_ROLE_B" "See agent-chat#11 for the current fix status."
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count, tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "1|f" ]
+
+}
+
+@test "TC-115: an idle gap longer than the breaker window resets the pair" {
+    _tc11x_setup_roles_and_schema
+
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "Non substantive repeat $i." >/dev/null
+    done
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+
+    # Simulate the window having elapsed (breaker window is 15 minutes).
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "UPDATE agent_chat_breaker_state SET last_message_at = now() - interval '20 minutes' WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+
+    run _tc11x_send_as_a "$_TC11X_ROLE_B" "Non substantive repeat after cooldown."
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count, tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "1|f" ]
+
+}
+
+@test "TC-116: broadcast messages bypass the circuit breaker entirely" {
+    _tc11x_setup_roles_and_schema
+
+    for i in 1 2 3 4 5 6 7 8; do
+        run _tc11x_send_as_a '*' "Broadcast repeat $i"
+        [ "$status" -eq 0 ]
+        [ -n "$output" ]   # every broadcast must be delivered, none suppressed
+    done
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}' AND recipients = ARRAY['*'];"
+    [ "$output" = "8" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_breaker_state WHERE recipient = '*';"
+    [ "$output" = "0" ]
+
+}
+
+@test "TC-117: standard agent roles cannot write directly to the new control tables" {
+    _tc11x_setup_roles_and_schema
+
+    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_error_templates (pattern) VALUES ('direct write attempt');"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"permission denied"* ]]
+
+    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_breaker_state (sender, recipient) VALUES ('x','y');"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"permission denied"* ]]
+
+    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_suppressed_log (reason, sender, recipients, message_sample) VALUES ('loop_breaker','x',ARRAY['y'],'z');"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"permission denied"* ]]
+
+    # SELECT must still work (loud-in-the-log constraint requires readability).
+    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_error_templates;"
+    [ "$status" -eq 0 ]
+    [ "$output" -ge 3 ]
+
+}
+
 # ─── expire_old_chat cron (TC-66) ───────────────────────────────────────────
 
 @test "TC-66: fresh install creates expire_old_chat cron entry targeting bus DB" {
@@ -358,10 +585,11 @@ teardown() {
     [[ "$output" == *"Applied schema.sql"* ]]
     [[ "$output" == *"Applied 001"* ]]
     [[ "$output" == *"Applied 004"* ]]
+    [[ "$output" == *"Applied 005"* ]]
 
     # Verify schema_version.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "4" ]
+    [ "$output" = "5" ]
 
     # Verify core objects.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"

@@ -127,6 +127,91 @@ BEGIN
 END;
 $$;
 
+-- Name: agent_chat_error_templates; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#11: denylist of runtime-error / non-actionable status templates.
+-- send_agent_message() quarantines any outbound body matching an active
+-- pattern here instead of inserting it into agent_chat. Additive-only: add
+-- new occurrences via INSERT, retire old ones with active=false rather than
+-- deleting rows.
+CREATE TABLE IF NOT EXISTS public.agent_chat_error_templates (
+    id SERIAL PRIMARY KEY,
+    pattern text NOT NULL,
+    description text,
+    added_at timestamptz NOT NULL DEFAULT now(),
+    active boolean NOT NULL DEFAULT true,
+    CONSTRAINT agent_chat_error_templates_pattern_key UNIQUE (pattern)
+);
+
+COMMENT ON TABLE public.agent_chat_error_templates IS
+    'agent-chat#11: denylist of case-insensitive regex patterns matched against '
+    'outbound message bodies in send_agent_message(). A match is quarantined '
+    '(logged to agent_chat_suppressed_log, never inserted into agent_chat).';
+
+INSERT INTO public.agent_chat_error_templates (pattern, description) VALUES
+    ('something went wrong while processing your request',
+     'agent-chat#11 occurrences 2-3: generic runtime-failure UI affordance, never content for another agent to reason about'),
+    ('context is too large and auto-compaction could not recover this turn',
+     'agent-chat#11 occurrence 4: runtime auto-compaction-failure template'),
+    ('context is saturated and cannot process turns',
+     'agent-chat#11 occurrence 4: agent-authored saturation notice -- self-describes as non-actionable and sends anyway')
+ON CONFLICT ON CONSTRAINT agent_chat_error_templates_pattern_key DO NOTHING;
+
+-- Name: agent_chat_is_error_template(text); Type: FUNCTION; Schema: public; Owner: -
+CREATE OR REPLACE FUNCTION public.agent_chat_is_error_template(p_message text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.agent_chat_error_templates
+        WHERE active AND p_message ~* pattern
+    );
+$$;
+
+-- Name: agent_chat_has_artifact_ref(text); Type: FUNCTION; Schema: public; Owner: -
+-- agent-chat#11: used by the circuit breaker to detect whether a message
+-- references new, substantive content (issue/PR/task number or file path).
+CREATE OR REPLACE FUNCTION public.agent_chat_has_artifact_ref(p_message text)
+RETURNS boolean
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT p_message ~* '#\d+|\y(?:issue|pr|task)[-_ ]*#?\d+\y|[/\\][\w.-]+\.[a-zA-Z0-9]{1,6}\y';
+$$;
+
+-- Name: agent_chat_breaker_state; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#11: per ordered (sender, recipient) rolling-window counter for
+-- the courtesy-reply-storm circuit breaker.
+CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_state (
+    sender text NOT NULL,
+    recipient text NOT NULL,
+    window_start timestamptz NOT NULL DEFAULT now(),
+    message_count integer NOT NULL DEFAULT 0,
+    tripped boolean NOT NULL DEFAULT false,
+    suppressed_count integer NOT NULL DEFAULT 0,
+    last_message_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_chat_breaker_state_pkey PRIMARY KEY (sender, recipient)
+);
+
+-- Name: agent_chat_suppressed_log; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#11: audit trail for every message send_agent_message() refused
+-- to deliver. Loud in the log, silent on the bus.
+CREATE TABLE IF NOT EXISTS public.agent_chat_suppressed_log (
+    id SERIAL PRIMARY KEY,
+    suppressed_at timestamptz NOT NULL DEFAULT now(),
+    reason text NOT NULL,
+    sender text NOT NULL,
+    recipients text[] NOT NULL,
+    message_sample text NOT NULL,
+    window_message_count integer,
+    CONSTRAINT agent_chat_suppressed_log_reason_check
+        CHECK (reason IN ('sender_filter_error_template', 'loop_breaker'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_chat_suppressed_log_time
+    ON public.agent_chat_suppressed_log (suppressed_at DESC);
+
 -- Name: send_agent_message(text, text, text[], interval, integer); Type: FUNCTION; Schema: public; Owner: -
 -- Defensive drop of all known historical signatures before CREATE OR REPLACE.
 -- Without this, applying this 5-arg schema against a database that still has
@@ -150,10 +235,15 @@ VOLATILE
 SECURITY DEFINER
 AS $$
 DECLARE
-    v_id         INTEGER;
-    v_sender     TEXT;
-    v_recipients TEXT[];
-    v_expires_at TIMESTAMPTZ;
+    v_id           INTEGER;
+    v_sender       TEXT;
+    v_recipients   TEXT[];
+    v_expires_at   TIMESTAMPTZ;
+    v_has_artifact BOOLEAN;
+    v_recipient    TEXT;
+    v_state        RECORD;
+    v_window       CONSTANT INTERVAL := interval '15 minutes';
+    v_threshold    CONSTANT INTEGER := 5; -- trips on the (threshold+1)th = 6th message
 BEGIN
     -- Validate sender matches the actual connected database user.
     -- Must use session_user (not current_user) because SECURITY DEFINER
@@ -180,9 +270,78 @@ BEGIN
         RAISE EXCEPTION 'send_agent_message: sender "%" is in the recipient list — agents cannot message themselves (did you mean to address someone else?)', v_sender;
     END IF;
 
+    -- agent-chat#11 DEFECT 1 FIX: sender-side runtime-error-template filter.
+    -- Applies unconditionally, before the breaker and before the insert, so it
+    -- holds for every caller regardless of recipient count or that agent's own
+    -- policy. Quarantine is silent on the bus (return NULL, no row inserted)
+    -- and loud in the log (one row per refused send in
+    -- agent_chat_suppressed_log) -- raising an exception here would itself
+    -- become a new error signal on the bus, reproducing the failure mode.
+    IF public.agent_chat_is_error_template(p_message) THEN
+        INSERT INTO public.agent_chat_suppressed_log (reason, sender, recipients, message_sample)
+        VALUES ('sender_filter_error_template', v_sender, v_recipients, left(p_message, 500));
+        RETURN NULL;
+    END IF;
+
     -- Compute expiry if TTL provided
     IF p_ttl IS NOT NULL THEN
         v_expires_at := NOW() + p_ttl;
+    END IF;
+
+    -- agent-chat#11 DEFECT 2 FIX: bus-side circuit breaker. Scoped to single,
+    -- non-broadcast recipients only -- every documented occurrence of this
+    -- failure mode is a 1:1 exchange, and a broadcast to ARRAY['*'] has no
+    -- well-defined "ordered pair" to track.
+    IF array_length(v_recipients, 1) = 1 AND v_recipients[1] != '*' THEN
+        v_recipient := v_recipients[1];
+        v_has_artifact := public.agent_chat_has_artifact_ref(p_message);
+
+        SELECT * INTO v_state
+        FROM public.agent_chat_breaker_state
+        WHERE sender = v_sender AND recipient = v_recipient
+        FOR UPDATE;
+
+        IF NOT FOUND THEN
+            INSERT INTO public.agent_chat_breaker_state
+                (sender, recipient, window_start, message_count, tripped, suppressed_count, last_message_at)
+            VALUES (v_sender, v_recipient, now(), 1, false, 0, now());
+        ELSIF v_has_artifact OR v_state.last_message_at < now() - v_window THEN
+            -- New artifact referenced, or the pair has been quiet longer than
+            -- the window: this is not a loop. Reset the counter.
+            UPDATE public.agent_chat_breaker_state
+            SET window_start = now(), message_count = 1, tripped = false,
+                suppressed_count = 0, last_message_at = now()
+            WHERE sender = v_sender AND recipient = v_recipient;
+        ELSE
+            -- Same ordered pair, still inside the idle window, no new artifact.
+            UPDATE public.agent_chat_breaker_state
+            SET message_count = v_state.message_count + 1,
+                last_message_at = now()
+            WHERE sender = v_sender AND recipient = v_recipient
+            RETURNING * INTO v_state;
+
+            IF v_state.message_count > v_threshold THEN
+                IF NOT v_state.tripped THEN
+                    -- First message past the threshold: log once, loudly.
+                    INSERT INTO public.agent_chat_suppressed_log
+                        (reason, sender, recipients, message_sample, window_message_count)
+                    VALUES ('loop_breaker', v_sender, v_recipients, left(p_message, 500), v_state.message_count);
+
+                    UPDATE public.agent_chat_breaker_state
+                    SET tripped = true, suppressed_count = 1
+                    WHERE sender = v_sender AND recipient = v_recipient;
+                ELSE
+                    -- Already tripped: stay silent on the bus AND on the log
+                    -- (the trip is already recorded); just keep the running
+                    -- count for diagnosability.
+                    UPDATE public.agent_chat_breaker_state
+                    SET suppressed_count = suppressed_count + 1
+                    WHERE sender = v_sender AND recipient = v_recipient;
+                END IF;
+
+                RETURN NULL;
+            END IF;
+        END IF;
     END IF;
 
     -- Atomic insert including reply_to; the enforce trigger allows this because
@@ -408,6 +567,46 @@ GRANT SELECT ON TABLE public.v_agent_chat_stats TO victoria;
 -- document the required EXECUTE capability for victoria and nova-staging
 -- without revoking PUBLIC access.
 GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
+
+-- agent-chat#11: lock down direct writes on the new circuit-breaker control
+-- tables the same way agent_chat itself is locked down. The `ALTER DEFAULT
+-- PRIVILEGES FOR ROLE postgres ... GRANT DELETE, INSERT, SELECT, UPDATE ON
+-- TABLES` block above applies automatically to any new table postgres
+-- creates, including these three -- so without this explicit revoke, every
+-- standard agent role would get direct INSERT/UPDATE/DELETE on the breaker
+-- state and audit tables, defeating "send_agent_message() is the only write
+-- path". SELECT is preserved for diagnosability (loud-in-the-log constraint).
+DO $$
+DECLARE
+    v_roles CONSTANT text[] := ARRAY[
+        'argus','athena','coder','conductor','erato','flint','gem','gidget',
+        'graybeard','hermes','iris','marcie','nova','quill','scout','scribe',
+        'ticker','victoria'
+    ];
+    v_role text;
+    v_table text;
+BEGIN
+    FOREACH v_table IN ARRAY ARRAY[
+        'agent_chat_error_templates',
+        'agent_chat_breaker_state',
+        'agent_chat_suppressed_log'
+    ]
+    LOOP
+        FOREACH v_role IN ARRAY v_roles
+        LOOP
+            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+                EXECUTE format(
+                    'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
+                    v_table, v_role
+                );
+                EXECUTE format(
+                    'GRANT SELECT ON TABLE public.%I TO %I',
+                    v_table, v_role
+                );
+            END IF;
+        END LOOP;
+    END LOOP;
+END $$;
 
 --
 -- Name: schema_version; Type: TABLE; Schema: public; Owner: -

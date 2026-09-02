@@ -146,6 +146,8 @@ Sorted migrations live in [`migrations/`](migrations/):
 | `001-send-agent-message-reply-to.sql` | Historical: add `p_reply_to` to `send_agent_message()` (nova-mind#548). |
 | `002-fix-immutability-trigger-binding.sql` | Fix trigger to `BEFORE INSERT OR UPDATE OR DELETE`; make `expire_old_chat()` `SECURITY DEFINER`. |
 | `003-add-schema-sync-infrastructure.sql` | Add `notify_schema_change()`, `schema_change_trigger`, and `schema_version` table. |
+| `004-expire-old-chat-processed-cascade.sql` | Make `agent_chat_processed.chat_id` FK `ON DELETE CASCADE` and validated; clean up orphaned processed rows (agent-chat#4). |
+| `005-courtesy-reply-storm-circuit-breaker.sql` | Add sender-side runtime-error-template filter and bus-side circuit breaker to `send_agent_message()` (agent-chat#11). |
 
 ## Deviations from pre-extraction production
 
