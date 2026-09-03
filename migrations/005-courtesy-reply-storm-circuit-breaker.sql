@@ -22,9 +22,6 @@
 --     returns NULL (no agent_chat row, no exception -- raising here would
 --     itself be a new error signal on the bus, which is the exact failure
 --     mode being fixed) and writes one row to agent_chat_suppressed_log.
---   * The breaker only applies to single, non-broadcast recipients. Every
---     documented occurrence of this failure mode is a 1:1 exchange; ARRAY['*']
---     broadcasts are excluded by design and never touch agent_chat_breaker_state.
 --   * The breaker window is idle-reset, not a fixed bucket: as long as
 --     messages keep arriving faster than v_window apart, the counter keeps
 --     accumulating (this is what makes a sustained storm trip and stay
@@ -59,7 +56,61 @@
 -- ON CONFLICT on a UNIQUE(pattern) constraint; CREATE OR REPLACE FUNCTION is
 -- idempotent; REVOKE is idempotent (revoking a privilege that is not held is
 -- a no-op, not an error).
-
+--
+-- ─── 2026-09-03 QA remediation (Gem adversarial review, PR #12) ────────────
+-- Three BLOCKING defects were found by live testing against real PG 16.15 and
+-- fixed in place (this migration has not shipped, so it is amended directly
+-- rather than adding a migration 006):
+--
+--   BLOCKING #1 -- sender-side filter false positives. The original
+--   agent_chat_is_error_template() was an unanchored `~*` substring match: any
+--   message that merely QUOTED or paraphrased a known template string --
+--   including a genuine error report asking for help, a peer-investigation
+--   request, an all-caps restatement, or a third-party observation about
+--   another agent's degraded state -- was silently swallowed. Fixed by
+--   requiring the pattern to constitute essentially the ENTIRE message
+--   (normalized coverage_ratio >= 0.25 and the match must start within the
+--   first 5 normalized characters), not merely appear somewhere inside it.
+--   See agent_chat_normalize_for_match() and the updated
+--   agent_chat_is_error_template().
+--
+--   BLOCKING #2 -- a tripped breaker suppressed ALL subsequent traffic for
+--   the pair indefinitely, including a genuinely new, unrelated, urgent
+--   message ("URGENT: production database is down" was silently dropped
+--   right after a storm of "still working on it" pings tripped the breaker).
+--   Fixed with a content-novelty escape hatch: agent_chat_message_shape()
+--   reduces a body to lowercase, digit-stripped, whitespace-collapsed text so
+--   that "Note 1 concludes nothing" and "Note 2 concludes nothing" are the
+--   SAME shape (still capped -- this is what a real storm looks like) but
+--   "URGENT: production database is down" is a DIFFERENT shape. A message
+--   whose shape differs from the shape currently driving the trip is let
+--   through once the pair's escape_count budget (3, generous but bounded so
+--   varying the wording every time cannot become an infinite bypass) is not
+--   exhausted. The existing idle-window reset (TC-115) remains the
+--   time-based liveness mechanism; this adds a content-based one for
+--   messages that cannot wait out the window.
+--
+--   BLOCKING #3 -- broadcasts (`ARRAY['*']`) bypassed the breaker entirely;
+--   10 consecutive non-substantive broadcasts all delivered with zero
+--   throttling. Fixed by extending the breaker to broadcasts, keyed on
+--   (sender, '*') -- a sender-scoped breaker, since a broadcast has no
+--   well-defined ordered pair with a single counterparty. This required no
+--   schema change: agent_chat_breaker_state's existing (sender, recipient)
+--   primary key already accommodates recipient = '*' as an ordinary key
+--   value. The scoping condition changed from `array_length(v_recipients,1)
+--   = 1 AND v_recipients[1] != '*'` to `array_length(v_recipients,1) = 1`
+--   (multi-recipient, non-broadcast sends -- e.g. an explicit list of several
+--   named agents -- remain out of scope, unchanged from the original design;
+--   no occurrence of this failure mode has ever used that shape).
+--
+--   ACCEPTED RISK (non-blocking, called out per QA review): agent_chat_has_
+--   artifact_ref()'s `#\d+` clause is context-free -- "room #12" or "rule #1"
+--   inside an otherwise non-substantive message resets the breaker's counter
+--   just as a real issue/PR reference would. This is an intentional
+--   recall-over-precision tradeoff: a false "has artifact" only costs one
+--   early reset of a pair's counter, whereas a false "no artifact" is exactly
+--   what lets a real storm run unchecked. Not redesigned per QA guidance;
+--   documented here and in the PR body as an accepted risk.
 BEGIN;
 
 -- ─── Sender-side filter: error-template denylist ───────────────────────────
@@ -89,6 +140,46 @@ INSERT INTO public.agent_chat_error_templates (pattern, description) VALUES
      'agent-chat#11 occurrence 4: agent-authored saturation notice -- self-describes as non-actionable and sends anyway')
 ON CONFLICT ON CONSTRAINT agent_chat_error_templates_pattern_key DO NOTHING;
 
+-- Name: agent_chat_normalize_for_match(text); Type: FUNCTION; Schema: public; Owner: -
+-- agent-chat#11 BLOCKING #1 fix (2026-09-03 QA remediation): lowercases and
+-- collapses every run of non-alphanumeric characters (whitespace, punctuation,
+-- emoji) to a single space, then trims. Used by agent_chat_is_error_template()
+-- so pattern matching is insensitive to case and incidental punctuation/emoji
+-- framing while still supporting a whole-message coverage check.
+CREATE OR REPLACE FUNCTION public.agent_chat_normalize_for_match(p_text text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT trim(regexp_replace(lower(p_text), '[^a-z0-9]+', ' ', 'g'));
+$$;
+
+COMMENT ON FUNCTION public.agent_chat_normalize_for_match(text) IS
+    'agent-chat#11: lowercase + non-alphanumeric-collapse normalization used by '
+    'agent_chat_is_error_template() for whole-message coverage matching.';
+
+-- Name: agent_chat_is_error_template(text); Type: FUNCTION; Schema: public; Owner: -
+-- agent-chat#11 BLOCKING #1 fix (2026-09-03 QA remediation, Gem QA): the
+-- original unanchored `~*` substring match suppressed ANY message that merely
+-- quoted or paraphrased a known template, including substantive error
+-- reports, peer-investigation requests, an all-caps restatement, and a
+-- third-party observation about another agent's degraded state -- exactly the
+-- messages a human/agent most needs to see. Fixed: require the pattern to
+-- constitute essentially the ENTIRE message (case/punctuation-insensitive),
+-- not merely appear somewhere inside it:
+--   * coverage_ratio = normalized(pattern) length / normalized(message) length
+--     must be >= 0.25 -- the pattern must be the dominant content of the
+--     message, not a small fragment quoted inside a much longer, substantive
+--     body.
+--   * the match must start within the first 5 normalized characters of the
+--     message -- tolerance for a leading emoji/glyph that normalization has
+--     already collapsed to nothing, or a short lead-in token like "The " --
+--     while still rejecting a message that leads with substantive framing
+--     before reaching the template text.
+-- Both known real occurrences (the runtime UI affordance strings, bare or
+-- with a trailing "try again"/"/compact" instruction) satisfy both
+-- conditions; every constructed false positive found in QA fails at least
+-- one (see tests/test_agent_chat_installer.bats TC-118).
 CREATE OR REPLACE FUNCTION public.agent_chat_is_error_template(p_message text)
 RETURNS boolean
 LANGUAGE sql
@@ -96,14 +187,26 @@ STABLE
 AS $$
     SELECT EXISTS (
         SELECT 1
-        FROM public.agent_chat_error_templates
-        WHERE active AND p_message ~* pattern
+        FROM public.agent_chat_error_templates t
+        CROSS JOIN LATERAL (
+            SELECT
+                public.agent_chat_normalize_for_match(p_message) AS m_norm,
+                public.agent_chat_normalize_for_match(t.pattern)  AS p_norm
+        ) n
+        WHERE t.active
+          AND length(n.p_norm) > 0
+          AND length(n.m_norm) > 0
+          AND position(n.p_norm IN n.m_norm) > 0
+          AND (position(n.p_norm IN n.m_norm) - 1) <= 5
+          AND length(n.p_norm)::numeric / length(n.m_norm) >= 0.25
     );
 $$;
 
 COMMENT ON FUNCTION public.agent_chat_is_error_template(text) IS
-    'agent-chat#11: true if p_message matches any active row in '
-    'agent_chat_error_templates. STABLE (reads a table) not IMMUTABLE.';
+    'agent-chat#11: true if p_message is essentially a bare known error/status '
+    'template (normalized coverage_ratio >= 0.25, match starts within the first '
+    '5 normalized chars) -- not merely a message that quotes or references one. '
+    'STABLE (reads a table) not IMMUTABLE.';
 
 -- ─── Bus-side circuit breaker: artifact-reference detector ─────────────────
 
@@ -117,13 +220,43 @@ AS $$
     -- ("dir/file.ext", "dir\file.ext"). Deliberately loose (recall over
     -- precision) -- a false "has artifact" only means the breaker resets one
     -- exchange early, whereas a false "no artifact" is what causes storms.
+    --
+    -- ACCEPTED RISK (2026-09-03 QA remediation, Gem QA, non-blocking): the
+    -- `#\d+` clause is context-free -- "room #12" or "rule #1" inside an
+    -- otherwise non-substantive message resets the counter just as a real
+    -- issue/PR reference would. Not redesigned per QA guidance (the
+    -- recall-over-precision tradeoff is intentional and was explicitly
+    -- accepted); documented here and in the PR body.
     SELECT p_message ~* '#\d+|\y(?:issue|pr|task)[-_ ]*#?\d+\y|[/\\][\w.-]+\.[a-zA-Z0-9]{1,6}\y';
 $$;
 
 COMMENT ON FUNCTION public.agent_chat_has_artifact_ref(text) IS
     'agent-chat#11: true if p_message references an issue/PR/task number or a '
     'file path. Used by the circuit breaker to reset a sender/recipient pair''s '
-    'window when new, substantive content appears.';
+    'window when new, substantive content appears. ACCEPTED RISK: #\d+ is '
+    'context-free ("room #12" also matches) -- intentional recall-over-'
+    'precision tradeoff, not redesigned per QA guidance (2026-09-03).';
+
+-- Name: agent_chat_message_shape(text); Type: FUNCTION; Schema: public; Owner: -
+-- agent-chat#11 BLOCKING #2 fix (2026-09-03 QA remediation): normalized
+-- "shape" of a message body used by the circuit breaker's content-novelty
+-- escape check -- lowercase, digits removed (so "note 1"/"note 2" collapse to
+-- the same shape), non-letters collapsed to single spaces, trimmed. Two
+-- messages with the same shape are treated as the same repeating storm body
+-- even if a counter/id differs; a different shape is treated as genuinely new
+-- content and can escape a tripped breaker (see send_agent_message()).
+CREATE OR REPLACE FUNCTION public.agent_chat_message_shape(p_message text)
+RETURNS text
+LANGUAGE sql
+IMMUTABLE
+AS $$
+    SELECT trim(regexp_replace(regexp_replace(lower(p_message), '[0-9]+', '', 'g'), '[^a-z]+', ' ', 'g'));
+$$;
+
+COMMENT ON FUNCTION public.agent_chat_message_shape(text) IS
+    'agent-chat#11: digit-stripped, letters-only normalized shape of a message '
+    'body. Used by the circuit breaker''s content-novelty escape hatch to '
+    'distinguish a repeating storm body from genuinely new content.';
 
 -- ─── Bus-side circuit breaker: state and audit tables ──────────────────────
 
@@ -135,16 +268,41 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_state (
     tripped boolean NOT NULL DEFAULT false,
     suppressed_count integer NOT NULL DEFAULT 0,
     last_message_at timestamptz NOT NULL DEFAULT now(),
+    last_shape text NOT NULL DEFAULT '',
+    escape_count integer NOT NULL DEFAULT 0,
     CONSTRAINT agent_chat_breaker_state_pkey PRIMARY KEY (sender, recipient)
 );
 
+-- Idempotent column add for any environment where this migration was applied
+-- before the 2026-09-03 QA remediation added these two columns (defense in
+-- depth; this migration has not shipped, so no live database should hit this
+-- path, but ADD COLUMN IF NOT EXISTS costs nothing and removes any ordering
+-- hazard).
+ALTER TABLE public.agent_chat_breaker_state ADD COLUMN IF NOT EXISTS last_shape text NOT NULL DEFAULT '';
+ALTER TABLE public.agent_chat_breaker_state ADD COLUMN IF NOT EXISTS escape_count integer NOT NULL DEFAULT 0;
+
 COMMENT ON TABLE public.agent_chat_breaker_state IS
     'agent-chat#11: per ordered (sender, recipient) rolling-window counter for '
-    'the courtesy-reply-storm circuit breaker. message_count resets to 1 when '
-    'the pair has been idle longer than the breaker window or a message '
-    'references a new artifact; otherwise it accumulates and, once it exceeds '
-    'the threshold, tripped flips true and further sends for the pair are '
-    'suppressed (suppressed_count keeps counting) until the next reset.';
+    'the courtesy-reply-storm circuit breaker. recipient may be ''*'' -- a '
+    'sender-scoped breaker for broadcasts, since a broadcast has no single '
+    'well-defined counterparty. message_count resets to 1 when the pair has '
+    'been idle longer than the breaker window or a message references a new '
+    'artifact; otherwise it accumulates and, once it exceeds the threshold, '
+    'tripped flips true and further sends for the pair are suppressed '
+    '(suppressed_count keeps counting) unless the content-novelty escape hatch '
+    '(last_shape/escape_count) admits a genuinely new-shaped body.';
+
+COMMENT ON COLUMN public.agent_chat_breaker_state.last_shape IS
+    'agent-chat#11 BLOCKING #2 fix: agent_chat_message_shape() of the most '
+    'recently processed message for this pair. A subsequent message whose '
+    'shape differs is treated as content-novel and may escape a tripped '
+    'breaker (bounded by escape_count).';
+
+COMMENT ON COLUMN public.agent_chat_breaker_state.escape_count IS
+    'agent-chat#11 BLOCKING #2 fix: number of content-novelty escapes granted '
+    'since the last full reset. Capped at 3 (generous but bounded) so varying '
+    'the wording every message cannot become an infinite bypass of the '
+    'breaker.';
 
 CREATE TABLE IF NOT EXISTS public.agent_chat_suppressed_log (
     id SERIAL PRIMARY KEY,
@@ -189,15 +347,18 @@ VOLATILE
 SECURITY DEFINER
 AS $$
 DECLARE
-    v_id           INTEGER;
-    v_sender       TEXT;
-    v_recipients   TEXT[];
-    v_expires_at   TIMESTAMPTZ;
-    v_has_artifact BOOLEAN;
-    v_recipient    TEXT;
-    v_state        RECORD;
-    v_window       CONSTANT INTERVAL := interval '15 minutes';
-    v_threshold    CONSTANT INTEGER := 5; -- trips on the (threshold+1)th = 6th message
+    v_id             INTEGER;
+    v_sender         TEXT;
+    v_recipients     TEXT[];
+    v_expires_at     TIMESTAMPTZ;
+    v_has_artifact   BOOLEAN;
+    v_shape          TEXT;
+    v_recipient      TEXT;
+    v_state          RECORD;
+    v_escaped        BOOLEAN := false;
+    v_window         CONSTANT INTERVAL := interval '15 minutes';
+    v_threshold      CONSTANT INTEGER := 5; -- trips on the (threshold+1)th = 6th message
+    v_escape_limit   CONSTANT INTEGER := 3; -- agent-chat#11 BLOCKING #2 fix: max content-novelty escapes per trip epoch
 BEGIN
     -- Validate sender matches the actual connected database user.
     -- Must use session_user (not current_user) because SECURITY DEFINER
@@ -231,6 +392,8 @@ BEGIN
     -- and loud in the log (one row per refused send in
     -- agent_chat_suppressed_log) -- raising an exception here would itself
     -- become a new error signal on the bus, reproducing the failure mode.
+    -- (2026-09-03 QA remediation: agent_chat_is_error_template() now requires
+    -- essentially-whole-message coverage; see BLOCKING #1 above.)
     IF public.agent_chat_is_error_template(p_message) THEN
         INSERT INTO public.agent_chat_suppressed_log (reason, sender, recipients, message_sample)
         VALUES ('sender_filter_error_template', v_sender, v_recipients, left(p_message, 500));
@@ -242,13 +405,17 @@ BEGIN
         v_expires_at := NOW() + p_ttl;
     END IF;
 
-    -- agent-chat#11 DEFECT 2 FIX: bus-side circuit breaker. Scoped to single,
-    -- non-broadcast recipients only -- every documented occurrence of this
-    -- failure mode is a 1:1 exchange, and a broadcast to ARRAY['*'] has no
-    -- well-defined "ordered pair" to track.
-    IF array_length(v_recipients, 1) = 1 AND v_recipients[1] != '*' THEN
+    -- agent-chat#11 DEFECT 2 FIX: bus-side circuit breaker.
+    -- 2026-09-03 QA remediation (BLOCKING #3): scoping now covers single
+    -- recipients INCLUDING the '*' broadcast target -- a sender-scoped
+    -- breaker keyed on (sender, '*'), since a broadcast has no well-defined
+    -- ordered pair with a single counterparty. Multi-recipient, non-broadcast
+    -- sends (e.g. an explicit list of several named agents) remain out of
+    -- scope, unchanged from the original design.
+    IF array_length(v_recipients, 1) = 1 THEN
         v_recipient := v_recipients[1];
         v_has_artifact := public.agent_chat_has_artifact_ref(p_message);
+        v_shape := public.agent_chat_message_shape(p_message);
 
         SELECT * INTO v_state
         FROM public.agent_chat_breaker_state
@@ -257,14 +424,16 @@ BEGIN
 
         IF NOT FOUND THEN
             INSERT INTO public.agent_chat_breaker_state
-                (sender, recipient, window_start, message_count, tripped, suppressed_count, last_message_at)
-            VALUES (v_sender, v_recipient, now(), 1, false, 0, now());
+                (sender, recipient, window_start, message_count, tripped, suppressed_count, last_message_at, last_shape, escape_count)
+            VALUES (v_sender, v_recipient, now(), 1, false, 0, now(), v_shape, 0);
         ELSIF v_has_artifact OR v_state.last_message_at < now() - v_window THEN
             -- New artifact referenced, or the pair has been quiet longer than
-            -- the window: this is not a loop. Reset the counter.
+            -- the window: this is not a loop. Reset the counter (and the
+            -- content-novelty escape budget/shape tracking).
             UPDATE public.agent_chat_breaker_state
             SET window_start = now(), message_count = 1, tripped = false,
-                suppressed_count = 0, last_message_at = now()
+                suppressed_count = 0, last_message_at = now(),
+                last_shape = v_shape, escape_count = 0
             WHERE sender = v_sender AND recipient = v_recipient;
         ELSE
             -- Same ordered pair, still inside the idle window, no new artifact.
@@ -275,25 +444,65 @@ BEGIN
             RETURNING * INTO v_state;
 
             IF v_state.message_count > v_threshold THEN
-                IF NOT v_state.tripped THEN
-                    -- First message past the threshold: log once, loudly.
-                    INSERT INTO public.agent_chat_suppressed_log
-                        (reason, sender, recipients, message_sample, window_message_count)
-                    VALUES ('loop_breaker', v_sender, v_recipients, left(p_message, 500), v_state.message_count);
-
+                -- agent-chat#11 BLOCKING #2 fix: content-novelty escape hatch.
+                -- v_state.last_shape/tripped/escape_count here are the values
+                -- from BEFORE this message (captured by the RETURNING above).
+                -- IMPORTANT: last_shape is frozen at the shape that TRIPPED the
+                -- breaker and is intentionally NOT updated on escape or on
+                -- ordinary suppression below -- if it were updated to each
+                -- escaping message's own shape, a second escaping message with
+                -- yet another different shape would compare against the FIRST
+                -- escapee's shape (always "different") rather than the
+                -- original storm shape, and a literal repeat of the original
+                -- storm body would incorrectly compare as "novel" and escape
+                -- again. Freezing last_shape at trip time makes escape
+                -- decisions and budget consumption depend only on how the
+                -- CURRENT message compares to the ORIGINAL storm shape.
+                IF v_shape IS DISTINCT FROM v_state.last_shape AND v_state.escape_count < v_escape_limit THEN
+                    -- Genuinely new-shaped content (e.g. a real urgent message
+                    -- arriving right after a storm of near-identical pings)
+                    -- escapes suppression even though the pair is tripped.
+                    -- The breaker stays tripped for the ORIGINAL shape; only
+                    -- this differently-shaped message is let through, and the
+                    -- escape budget is consumed so an unbounded run of
+                    -- differently-worded messages is still eventually capped.
                     UPDATE public.agent_chat_breaker_state
-                    SET tripped = true, suppressed_count = 1
+                    SET escape_count = v_state.escape_count + 1
                     WHERE sender = v_sender AND recipient = v_recipient;
+                    v_escaped := true;
                 ELSE
-                    -- Already tripped: stay silent on the bus AND on the log
-                    -- (the trip is already recorded); just keep the running
-                    -- count for diagnosability.
-                    UPDATE public.agent_chat_breaker_state
-                    SET suppressed_count = suppressed_count + 1
-                    WHERE sender = v_sender AND recipient = v_recipient;
-                END IF;
+                    IF NOT v_state.tripped THEN
+                        -- First message past the threshold: log once, loudly.
+                        -- This message's shape becomes the frozen baseline
+                        -- ( "the storm shape" ) that all subsequent
+                        -- escape/suppress decisions for this trip compare
+                        -- against.
+                        INSERT INTO public.agent_chat_suppressed_log
+                            (reason, sender, recipients, message_sample, window_message_count)
+                        VALUES ('loop_breaker', v_sender, v_recipients, left(p_message, 500), v_state.message_count);
 
-                RETURN NULL;
+                        UPDATE public.agent_chat_breaker_state
+                        SET tripped = true, suppressed_count = 1, last_shape = v_shape
+                        WHERE sender = v_sender AND recipient = v_recipient;
+                    ELSE
+                        -- Already tripped, same shape as the original storm (or
+                        -- escape budget spent): stay silent on the bus AND on
+                        -- the log (the trip is already recorded); just keep
+                        -- the running count for diagnosability. last_shape is
+                        -- deliberately left untouched (see comment above).
+                        UPDATE public.agent_chat_breaker_state
+                        SET suppressed_count = suppressed_count + 1
+                        WHERE sender = v_sender AND recipient = v_recipient;
+                    END IF;
+
+                    RETURN NULL;
+                END IF;
+            ELSE
+                -- Not yet past threshold -- track shape so a later trip has an
+                -- accurate baseline to compare content-novelty against.
+                UPDATE public.agent_chat_breaker_state
+                SET last_shape = v_shape
+                WHERE sender = v_sender AND recipient = v_recipient;
             END IF;
         END IF;
     END IF;
