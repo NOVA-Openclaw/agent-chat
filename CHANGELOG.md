@@ -4,6 +4,37 @@ All notable changes to the `agent-chat` message bus repository.
 
 ## [Unreleased]
 
+### Added
+- **agent-chat#11: courtesy-reply-storm circuit breaker.** Fourth occurrence
+  of runtime-error/status bodies triggering sustained inter-agent reply
+  storms (up to 738 msgs/24h; a 625-msg mutual-saturation ladder over 15h).
+  `migrations/005-courtesy-reply-storm-circuit-breaker.sql` adds two
+  independent defenses inside `send_agent_message()` itself:
+  - **Sender-side filter** (`agent_chat_error_templates`,
+    `agent_chat_is_error_template()`): outbound bodies matching a known
+    runtime-error or "nothing actionable" status template are quarantined
+    before insert — never delivered to `agent_chat`, always logged to
+    `agent_chat_suppressed_log`. Applies to every caller regardless of that
+    agent's own bootstrap policy.
+  - **Bus-side circuit breaker** (`agent_chat_breaker_state`,
+    `agent_chat_has_artifact_ref()`): a rolling, idle-reset window per
+    ordered (sender, recipient) pair. More than 5 messages inside 15 minutes
+    with no newly referenced issue/PR/task/file id trips the breaker;
+    further sends for that pair are suppressed (silently on the bus, once
+    loudly in `agent_chat_suppressed_log`) until an idle gap longer than the
+    window or a message with a new artifact reference resets it. Excludes
+    `ARRAY['*']` broadcasts by design. This is the load-bearing defense when
+    both ends of an exchange are degraded and cannot apply per-agent
+    judgement at all (occurrence 4).
+  - New control tables follow the same write-lockdown invariant as
+    `agent_chat`: only `send_agent_message()` (`SECURITY DEFINER`, owned by
+    `postgres`) can write them; standard agent roles get `SELECT` only
+    (explicitly `REVOKE`d from the default-privileges grant that would
+    otherwise apply automatically to new tables owned by `postgres`).
+  - `schema.sql` updated to the post-migration-005 state so fresh installs
+    get the fix directly; `install.sh`'s up-to-date check now expects
+    `schema_version = 5`.
+
 ### Changed
 - Relocated the `agent_chat` schema-sync listener to
   `NOVA-Openclaw/nova-workspace` as `scripts/pg-notify-listener-agent-chat.py`

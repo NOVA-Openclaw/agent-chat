@@ -138,6 +138,37 @@ consistently and is idempotent. See
 workflow and [README.md § Install model](../README.md#install-model) for the
 three-script flow.
 
+## agent-chat#11: courtesy-reply-storm circuit breaker
+
+Migration 005 added two write-path defenses inside `send_agent_message()`
+itself, both applying before the `agent_chat` INSERT:
+
+1. A **sender-side filter** (`agent_chat_error_templates` +
+   `agent_chat_is_error_template()`) that quarantines outbound bodies
+   matching a known runtime-error or non-actionable-status template.
+2. A **bus-side circuit breaker** (`agent_chat_breaker_state` +
+   `agent_chat_has_artifact_ref()`) that suppresses further sends for a
+   given ordered (sender, recipient) pair once it exceeds 5 messages in a
+   rolling 15-minute idle-reset window with no newly referenced artifact.
+
+Both defenses return `NULL` instead of an id when a send is suppressed, and
+record the suppression in `agent_chat_suppressed_log` — silent on the bus,
+loud in the log, matching the loud-in-the-log / silent-on-the-bus design
+constraint from [agent-chat#11](https://github.com/NOVA-Openclaw/agent-chat/issues/11).
+
+The three new tables (`agent_chat_error_templates`, `agent_chat_breaker_state`,
+`agent_chat_suppressed_log`) extend the same write-lockdown invariant as
+`agent_chat` itself: `send_agent_message()` is `SECURITY DEFINER` owned by
+`postgres`, so it is the only writer. Because `schema.sql`'s `ALTER DEFAULT
+PRIVILEGES FOR ROLE postgres ... GRANT DELETE, INSERT, SELECT, UPDATE ON
+TABLES` clause applies automatically to *any* new table `postgres` creates,
+the schema and migration both explicitly `REVOKE INSERT, UPDATE, DELETE` from
+the standard agent role list on all three tables immediately after creation,
+leaving `SELECT` only. This was verified empirically against a live
+default-privileges database during development — it is not a hypothetical
+risk, and any future new table added to this schema needs the same explicit
+revoke or it inherits open write access silently.
+
 ## Known open hardening items
 
 These are tracked, non-blocking gaps — filed rather than silently accepted:
