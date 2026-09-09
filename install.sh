@@ -231,13 +231,37 @@ _get_installed_version() {
   psql -d "$db_name" -v ON_ERROR_STOP=0 -At -c "SELECT COALESCE(MAX(version), 0) FROM public.schema_version;" 2>/dev/null || echo "0"
 }
 
+# Expected schema_version = highest numeric prefix in migrations/, or 1 if the
+# directory is absent/empty (schema.sql seeds schema_version to 1). Derived
+# rather than hardcoded so adding a migration cannot leave the check — or the
+# "up to date" message — reporting a stale version (agent-chat#6).
+_get_expected_version() {
+  local migrations_dir="$SCRIPT_DIR/migrations"
+  local highest=1
+
+  if [ -d "$migrations_dir" ]; then
+    local f base num
+    while IFS= read -r -d '' f; do
+      base="$(basename "$f")"
+      # Match a leading run of digits; skip files that don't start with one.
+      if [[ "$base" =~ ^([0-9]+) ]]; then
+        num=$((10#${BASH_REMATCH[1]}))
+        if [ "$num" -gt "$highest" ]; then
+          highest="$num"
+        fi
+      fi
+    done < <(find "$migrations_dir" -maxdepth 1 -name "*.sql" -print0 2>/dev/null)
+  fi
+
+  printf '%s' "$highest"
+}
+
 _is_up_to_date() {
   local db_name="$1"
-  local version
+  local version expected
   version="$(_get_installed_version "$db_name")"
-  # schema_version is seeded to 1 by schema.sql and advanced to 5 by migrations
-  # (agent-chat#11: courtesy-reply-storm circuit breaker).
-  [ "$version" = "5" ]
+  expected="$(_get_expected_version)"
+  [ "$version" = "$expected" ]
 }
 
 # Main ------------------------------------------------------------------------
@@ -262,7 +286,7 @@ main() {
   fi
 
   if [ "$db_existed" -eq 1 ] && _is_up_to_date "$DB_NAME"; then
-    echo -e "  ${INFO} agent_chat bus is up to date (schema_version 5, all expected objects present)"
+    echo -e "  ${INFO} agent_chat bus is up to date (schema_version $(_get_installed_version "$DB_NAME"), all expected objects present)"
     _detect_drift "$DB_NAME"
     _install_expire_old_chat_cron
     echo ""
