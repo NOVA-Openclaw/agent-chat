@@ -129,6 +129,10 @@ teardown() {
     if [ -n "${_TC11X_ROLE_B:-}" ]; then
         psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_B\";" >/dev/null 2>&1 || true
     fi
+    # agent-chat#18: role C is used by the multi-recipient breaker tests.
+    if [ -n "${_TC11X_ROLE_C:-}" ]; then
+        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_C\";" >/dev/null 2>&1 || true
+    fi
     if [ -n "${_TC11X_PGPASSFILE:-}" ]; then
         rm -f "$_TC11X_PGPASSFILE"
     fi
@@ -323,6 +327,9 @@ teardown() {
 
 _TC11X_ROLE_A=""
 _TC11X_ROLE_B=""
+# agent-chat#18: a third role is required to test mixed recipient arrays --
+# a tripped pair alongside an untripped one in the same send.
+_TC11X_ROLE_C=""
 _TC11X_PGPASSFILE=""
 
 _tc11x_setup_roles_and_schema() {
@@ -331,16 +338,19 @@ _tc11x_setup_roles_and_schema() {
 
     _TC11X_ROLE_A="zz11a_${BATS_TEST_NUMBER}_$$"
     _TC11X_ROLE_B="zz11b_${BATS_TEST_NUMBER}_$$"
+    _TC11X_ROLE_C="zz11c_${BATS_TEST_NUMBER}_$$"
     psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_A\" LOGIN PASSWORD 'tc11xpw';"
     psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_B\" LOGIN PASSWORD 'tc11xpw';"
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_state, public.agent_chat_suppressed_log TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
+    psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_C\" LOGIN PASSWORD 'tc11xpw';"
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\", \"$_TC11X_ROLE_C\";"
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_state, public.agent_chat_suppressed_log TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\", \"$_TC11X_ROLE_C\";"
 
     _TC11X_PGPASSFILE="$(mktemp)"
     chmod 600 "$_TC11X_PGPASSFILE"
     {
         echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_A}:tc11xpw"
         echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_B}:tc11xpw"
+        echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_C}:tc11xpw"
     } > "$_TC11X_PGPASSFILE"
 }
 
@@ -358,6 +368,26 @@ _tc11x_send_as_b() {
     local recipient="$1" message="$2"
     PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_B" -d "$AGENT_CHAT_DB_NAME" -At \
         -c "SELECT send_agent_message('${_TC11X_ROLE_B}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
+}
+
+# agent-chat#18: send as role A to an ARBITRARY LIST of recipients, so the
+# multi-recipient breaker path can be exercised. Recipients are passed as
+# separate arguments and assembled into a SQL array literal.
+_tc11x_send_as_a_multi() {
+    local message="$1"; shift
+    local quoted="" r
+    for r in "$@"; do
+        [ -n "$quoted" ] && quoted="${quoted},"
+        quoted="${quoted}'${r}'"
+    done
+    PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -At \
+        -c "SELECT send_agent_message('${_TC11X_ROLE_A}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY[${quoted}]);"
+}
+
+# agent-chat#18: read back the recipients array of the most recent delivered row.
+_tc11x_last_recipients() {
+    psql -d "$AGENT_CHAT_DB_NAME" -At \
+        -c "SELECT array_to_string(recipients, ',') FROM agent_chat ORDER BY id DESC LIMIT 1;"
 }
 
 @test "TC-110: sender-side filter quarantines the occurrence 2/3 runtime-error template" {
@@ -482,6 +512,118 @@ _tc11x_send_as_b() {
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count, tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
     [ "$output" = "1|f" ]
 
+}
+
+# ─── agent-chat#18 regression tests: multi-recipient breaker coverage ─────────
+
+@test "TC-120: repeated multi-recipient sends to the same set trip the breaker per pair (agent-chat#18)" {
+    _tc11x_setup_roles_and_schema
+
+    # Under 005 this array shape bypassed the breaker entirely: array_length != 1.
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a_multi "No reply needed here at all, repeat $i." "$_TC11X_ROLE_B" "$_TC11X_ROLE_C" >/dev/null
+    done
+
+    # BOTH pairs must have tripped.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_C}';"
+    [ "$output" = "t" ]
+
+    # 6th send had every pair suppressed => NULL, no row inserted. 5 delivered.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}';"
+    [ "$output" = "5" ]
+}
+
+@test "TC-121 DISCRIMINATES: a tripped pair cannot be bypassed by adding a second recipient (agent-chat#18 core defect)" {
+    _tc11x_setup_roles_and_schema
+
+    # Trip A->B only, using single-recipient sends (the 005-covered path).
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "Non substantive single repeat $i." >/dev/null
+    done
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+
+    # THE BYPASS: same storm body, now addressed to the tripped pair PLUS an
+    # untripped third party. Under 005 this delivered to B anyway.
+    run _tc11x_send_as_a_multi "Non substantive single repeat 7." "$_TC11X_ROLE_B" "$_TC11X_ROLE_C"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]   # still delivered -- but only to C
+
+    # B must be ABSENT from the delivered recipients; C must be present.
+    run _tc11x_last_recipients
+    [ "$output" = "${_TC11X_ROLE_C}" ]
+}
+
+@test "TC-122: an untripped recipient in a mixed array still receives the message (agent-chat#18)" {
+    _tc11x_setup_roles_and_schema
+
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "Filler repeat $i." >/dev/null
+    done
+
+    # C has never been messaged, so it must receive normally.
+    run _tc11x_send_as_a_multi "Filler repeat 7." "$_TC11X_ROLE_B" "$_TC11X_ROLE_C"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat WHERE sender = '${_TC11X_ROLE_A}' AND '${_TC11X_ROLE_C}' = ANY(recipients);"
+    [ "$output" = "1" ]
+}
+
+@test "TC-123: artifact reference resets every pair in a multi-recipient send (agent-chat#18)" {
+    _tc11x_setup_roles_and_schema
+
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a_multi "Nothing actionable, repeat $i." "$_TC11X_ROLE_B" "$_TC11X_ROLE_C" >/dev/null
+    done
+
+    run _tc11x_send_as_a_multi "See agent-chat#18 for the fix." "$_TC11X_ROLE_B" "$_TC11X_ROLE_C"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+
+    # NOTE: use the two-column `SELECT a, b` form with -At (as every other
+    # TC-11x test does), NOT `a || '|' || b`. psql renders a boolean as `f`
+    # when it is its own column but as `false` inside a string concatenation,
+    # so the concat form silently compares against the wrong literal.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count, tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "1|f" ]
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count, tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_C}';"
+    [ "$output" = "1|f" ]
+}
+
+@test "TC-124: duplicate recipients in one array are de-duplicated to a single pair (agent-chat#18)" {
+    _tc11x_setup_roles_and_schema
+
+    run _tc11x_send_as_a_multi "Checking dedupe behaviour." "$_TC11X_ROLE_B" "$_TC11X_ROLE_B"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+
+    # One pair row, counted once -- not twice.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT message_count FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "1" ]
+
+    run _tc11x_last_recipients
+    [ "$output" = "${_TC11X_ROLE_B}" ]
+}
+
+@test "TC-125: single-recipient and broadcast behaviour unchanged from 005 (agent-chat#18 no-regression)" {
+    _tc11x_setup_roles_and_schema
+
+    # Single recipient still trips on the 6th.
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a "$_TC11X_ROLE_B" "Single path repeat $i." >/dev/null
+    done
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '${_TC11X_ROLE_B}';"
+    [ "$output" = "t" ]
+
+    # Broadcast still keyed on (sender, '*').
+    for i in 1 2 3 4 5 6; do
+        _tc11x_send_as_a_multi "Broadcast repeat $i." "*" >/dev/null
+    done
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT tripped FROM agent_chat_breaker_state WHERE sender = '${_TC11X_ROLE_A}' AND recipient = '*';"
+    [ "$output" = "t" ]
 }
 
 # ─── 2026-09-03 QA remediation regression tests (Gem adversarial review, PR #12) ─
@@ -1021,9 +1163,25 @@ _tc11x_send_as_b() {
     [[ "$output" == *"Applied 004"* ]]
     [[ "$output" == *"Applied 005"* ]]
 
-    # Verify schema_version.
+    # Verify schema_version. Derived from migrations/ rather than hardcoded, for
+    # the same reason install.sh derives it (agent-chat#6): a hardcoded literal
+    # here turns every new migration into a spurious TC-01 failure, which trains
+    # readers to treat this assertion as noise. Caught when migration 006
+    # (agent-chat#18) made the previous hardcoded "5" stale.
+    local expected_version=1 base num
+    for f in "$REPO_ROOT"/migrations/*.sql; do
+        [ -e "$f" ] || continue
+        base="$(basename "$f")"
+        num="${base%%-*}"
+        case "$num" in
+            ''|*[!0-9]*) continue ;;
+        esac
+        num=$((10#$num))
+        [ "$num" -gt "$expected_version" ] && expected_version="$num"
+    done
+
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "5" ]
+    [ "$output" = "$expected_version" ]
 
     # Verify core objects.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"
