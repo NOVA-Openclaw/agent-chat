@@ -382,6 +382,27 @@ async function markMessageRouted(client: pg.Client, chatId: number, agentName: s
 }
 
 /**
+ * Build the log/failure-status messages for a suppressed failed-turn error
+ * banner. Pure/exported so the emit-boundary suppression decision (see
+ * deliver() below) is independently unit-testable without a live DB/runtime.
+ * (nova-openclaw/agent-chat#20)
+ */
+export function buildErrorBannerSuppressionMessages(params: {
+  messageId: number;
+  sender: string;
+  kind: string;
+  bannerText: string;
+}): { logMessage: string; failureMessage: string } {
+  const { messageId, sender, kind, bannerText } = params;
+  return {
+    logMessage:
+      `Suppressed failed-turn error banner for message ${messageId} ` +
+      `(sender=${sender}, kind=${kind}): ${bannerText}`,
+    failureMessage: `Suppressed error banner: ${bannerText}`,
+  };
+}
+
+/**
  * Mark message as failed with error
  */
 async function markMessageFailed(
@@ -765,7 +786,29 @@ export async function processAgentChatMessage({
     try {
       await dispatchWithReplyLifecycle({
         runtime,
-        deliver: async (payload, _info) => {
+        deliver: async (payload, info) => {
+          // Failed-turn error banners (billing errors, provider outages, etc.)
+          // must be suppressed at this emit boundary, not fanned out to peers
+          // on the inter-agent bus. text-matching downstream (the 2026-09-07
+          // "drop repeated banner" rule) always lags new banner wordings; the
+          // fix has to sit here, where the runtime already flags the payload.
+          // Loud in the log, silent on the bus (nova-openclaw/agent-chat#20).
+          if ((payload as { isError?: boolean }).isError) {
+            const { logMessage, failureMessage } = buildErrorBannerSuppressionMessages({
+              messageId: message.id,
+              sender: message.sender,
+              kind: info.kind,
+              bannerText: (payload as { text?: string }).text ?? "",
+            });
+            log?.error?.(logMessage);
+
+            // Mark the inbound as failed so status bookkeeping stays
+            // consistent and it is not retried, without ever writing the
+            // banner into agent_chat.
+            await markMessageFailed(client, message.id, dbUser, failureMessage);
+            return;
+          }
+
           const preview = truncateForLog((payload as { text?: string }).text ?? "");
           log?.info?.(
             `Suppressing automatic agent_chat reply for message ${message.id}: ${preview}`,
