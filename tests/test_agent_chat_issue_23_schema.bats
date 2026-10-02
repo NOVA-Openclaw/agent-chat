@@ -412,3 +412,101 @@ teardown_file() {
     [[ "$output" == *"$coder|responded"* ]]
     [[ "$output" == *"$flint|routed"* ]]
 }
+
+# ─── Requirement 4 dispatch-side cases ──────────────────────────────────────
+
+@test "TC-23-039: orphaned received rows are skipped by fetch path, not re-dispatched" {
+    local scout
+    scout="$(_issue23_agent_name scout)"
+    _ISSUE23_ROLES=("$scout")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$scout"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (390, 'nova', 'stuck message', ARRAY['$scout']); INSERT INTO public.agent_chat_processed (chat_id, agent, status, received_at) VALUES (390, '$scout', 'received', NOW()); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    # The fetch path excludes any row already present in agent_chat_processed,
+    # regardless of status. A received-only row is therefore never re-selected
+    # and never re-dispatched.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat ac LEFT JOIN agent_chat_processed acp ON ac.id = acp.chat_id AND LOWER(acp.agent) = LOWER('$scout') WHERE ac.id = 390 AND LOWER('$scout') = ANY(SELECT LOWER(unnest(ac.recipients))) AND acp.chat_id IS NULL;"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+
+    # Row is untouched.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status FROM public.agent_chat_processed WHERE chat_id = 390 AND agent = '$scout';"
+    [ "$output" = "received" ]
+}
+
+@test "TC-23-040: multi-agent received rows are isolated per agent" {
+    local scout marcie
+    scout="$(_issue23_agent_name scout)"
+    marcie="$(_issue23_agent_name marcie)"
+    _ISSUE23_ROLES=("$scout" "$marcie")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$scout" "$marcie"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (400, 'nova', 'group message', ARRAY['$scout','$marcie']); INSERT INTO public.agent_chat_processed (chat_id, agent, status, received_at) VALUES (400, '$scout', 'received', NOW()), (400, '$marcie', 'received', NOW()); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    for agent in "$scout" "$marcie"; do
+        run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat ac LEFT JOIN agent_chat_processed acp ON ac.id = acp.chat_id AND LOWER(acp.agent) = LOWER('$agent') WHERE ac.id = 400 AND LOWER('$agent') = ANY(SELECT LOWER(unnest(ac.recipients))) AND acp.chat_id IS NULL;"
+        [ "$status" -eq 0 ]
+        [ "$output" = "0" ]
+    done
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT agent, status FROM public.agent_chat_processed WHERE chat_id = 400 ORDER BY agent;"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"$scout|received"* ]]
+    [[ "$output" == *"$marcie|received"* ]]
+}
+
+@test "TC-23-041: responded rows are never re-selected for dispatch" {
+    local newhart
+    newhart="$(_issue23_agent_name newhart)"
+    _ISSUE23_ROLES=("$newhart")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$newhart"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (410, 'nova', 'already answered', ARRAY['$newhart']); INSERT INTO public.agent_chat_processed (chat_id, agent, status, responded_at) VALUES (410, '$newhart', 'responded', NOW()); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat ac LEFT JOIN agent_chat_processed acp ON ac.id = acp.chat_id AND LOWER(acp.agent) = LOWER('$newhart') WHERE ac.id = 410 AND LOWER('$newhart') = ANY(SELECT LOWER(unnest(ac.recipients))) AND acp.chat_id IS NULL;"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+# ─── Requirement 8 duplicate-dispatch race cases ────────────────────────────
+
+@test "TC-23-110: pre-fix UPSERT lets both callers proceed (race baseline)" {
+    local hermes
+    hermes="$(_issue23_agent_name hermes)"
+    _ISSUE23_ROLES=("$hermes")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$hermes"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (600, 'nova', 'race message', ARRAY['$hermes']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    # Pre-fix SQL shape: ON CONFLICT DO UPDATE. Both calls succeed.
+    local upsert_sql="INSERT INTO public.agent_chat_processed (chat_id, agent, status, received_at) VALUES (600, LOWER('$hermes'), 'received', NOW()) ON CONFLICT (chat_id, agent) DO UPDATE SET received_at = COALESCE(agent_chat_processed.received_at, NOW())"
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "$upsert_sql;"
+    [ "$status" -eq 0 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "$upsert_sql;"
+    [ "$status" -eq 0 ]
+}
+
+@test "TC-23-111: fixed claim pattern returns exactly one winner" {
+    local hermes
+    hermes="$(_issue23_agent_name hermes)"
+    _ISSUE23_ROLES=("$hermes")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$hermes"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (601, 'nova', 'race message', ARRAY['$hermes']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    local claim_sql="INSERT INTO public.agent_chat_processed (chat_id, agent, status, received_at) VALUES (601, LOWER('$hermes'), 'received', NOW()) ON CONFLICT (chat_id, agent) DO NOTHING RETURNING chat_id, agent, status"
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "$claim_sql;"
+    [ "$status" -eq 0 ]
+    # First caller wins: output contains the returned row (e.g. "601|hermes|received").
+    [[ "$output" == *"|received"* ]]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "$claim_sql;"
+    [ "$status" -eq 0 ]
+    # Second caller loses: only the command tag (INSERT 0 0) is printed, no row
+    # data with a pipe separator.
+    [[ "$output" != *"|"* ]]
+}

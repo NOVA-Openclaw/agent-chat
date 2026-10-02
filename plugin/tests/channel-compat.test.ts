@@ -128,10 +128,14 @@ function makeFakeClient(): {
     queries,
     query(sql: string, params?: unknown[]) {
       queries.push({ sql, params: params ?? [] });
-      if (sql.toLowerCase().startsWith("update agent_chat_processed")) {
+      const trimmedLower = sql.trim().toLowerCase();
+      if (trimmedLower.startsWith("update agent_chat_processed")) {
         return Promise.resolve({ rows: [] });
       }
-      if (sql.toLowerCase().startsWith("insert into agent_chat_processed")) {
+      if (trimmedLower.startsWith("insert into public.agent_chat_processed") && trimmedLower.includes("returning")) {
+        return Promise.resolve({ rows: [{ chat_id: params?.[0], agent: params?.[1], status: "received" }] });
+      }
+      if (trimmedLower.startsWith("insert into agent_chat_processed") || trimmedLower.startsWith("insert into public.agent_chat_processed")) {
         return Promise.resolve({ rows: [] });
       }
       return Promise.resolve({ rows: [] });

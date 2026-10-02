@@ -230,17 +230,27 @@ async function fetchUnprocessedMessages(client: pg.Client, agentName: string) {
 }
 
 /**
- * Mark message as received (initial state)
+ * Atomically claim a message for this agent.
+ *
+ * Uses INSERT ... ON CONFLICT DO NOTHING RETURNING so only the worker that
+ * actually creates the row proceeds to dispatch. A pre-existing row (from a
+ * concurrent worker, a prior partial run, or any terminal status) causes the
+ * caller to skip dispatch.
  */
-async function markMessageReceived(client: pg.Client, chatId: number, agentName: string) {
+async function claimMessage(
+  client: pg.Client,
+  chatId: number,
+  agentName: string,
+): Promise<{ chat_id: number; agent: string; status: string } | null> {
   const query = `
-    INSERT INTO agent_chat_processed (chat_id, agent, status, received_at)
+    INSERT INTO public.agent_chat_processed (chat_id, agent, status, received_at)
     VALUES ($1, LOWER($2), 'received', NOW())
-    ON CONFLICT (chat_id, agent) DO UPDATE
-    SET received_at = COALESCE(agent_chat_processed.received_at, NOW())
+    ON CONFLICT (chat_id, agent) DO NOTHING
+    RETURNING chat_id, agent, status
   `;
 
-  await client.query(query, [chatId, agentName]);
+  const result = await client.query(query, [chatId, agentName]);
+  return result.rows[0] ?? null;
 }
 
 /**
@@ -252,10 +262,11 @@ async function markMessageRouted(client: pg.Client, chatId: number, agentName: s
     SET status = 'routed', routed_at = NOW()
     WHERE chat_id = $1
       AND LOWER(agent) = LOWER($2)
-      -- Guard against a downstream "success" transition clobbering a terminal
-      -- status already written earlier in the same reply cycle (e.g. the
-      -- deliver callback's markMessageFailed call on FK-violation failures).
-      AND status NOT IN ('failed', 'responded')
+      -- Terminal statuses never regress. This protects against a downstream
+      -- "success" transition clobbering a terminal status already written
+      -- earlier in the same reply cycle (e.g. the deliver callback's
+      -- markMessageFailed call on FK-violation failures).
+      AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed')
   `;
 
   await client.query(query, [chatId, agentName]);
@@ -269,6 +280,9 @@ async function markMessageResponded(client: pg.Client, chatId: number, agentName
     UPDATE agent_chat_processed
     SET status = 'responded', responded_at = NOW()
     WHERE chat_id = $1 AND LOWER(agent) = LOWER($2)
+      -- Terminal statuses never regress; only move non-terminal rows to
+      -- responded.
+      AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed')
   `;
 
   await client.query(query, [chatId, agentName]);
@@ -287,9 +301,39 @@ async function markMessageFailed(
     UPDATE agent_chat_processed
     SET status = 'failed', error_message = $3
     WHERE chat_id = $1 AND LOWER(agent) = LOWER($2)
+      -- Terminal statuses never regress; only move received/routed rows to
+      -- failed.
+      AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed')
   `;
 
   await client.query(query, [chatId, agentName, errorMsg]);
+}
+
+/**
+ * Mark message as handled (terminal no-reply outcome).
+ */
+async function markMessageHandled(client: pg.Client, chatId: number, agentName: string) {
+  const query = `
+    UPDATE agent_chat_processed
+    SET status = 'handled', handled_at = NOW()
+    WHERE chat_id = $1 AND LOWER(agent) = LOWER($2)
+      AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed')
+  `;
+
+  await client.query(query, [chatId, agentName]);
+}
+
+/**
+ * Check whether this agent has already sent a reply linked to the original
+ * message via reply_to. This covers both dispatcher deliver() replies and
+ * direct send_agent_message() calls made outside the dispatcher.
+ */
+async function hasLinkedReply(client: pg.Client, chatId: number, agentName: string): Promise<boolean> {
+  const result = await client.query(
+    `SELECT 1 FROM public.agent_chat WHERE reply_to = $1 AND LOWER(sender) = LOWER($2) LIMIT 1`,
+    [chatId, agentName],
+  );
+  return result.rows.length > 0;
 }
 
 /**
@@ -360,13 +404,19 @@ export async function processAgentChatMessage({
   // Self-mention guard: prevent infinite loops
   if (message.sender.toLowerCase() === agentName.toLowerCase()) {
     log?.debug?.(`Skipping self-mention from ${message.sender}`);
-    await markMessageReceived(client, message.id, agentName);
+    await claimMessage(client, message.id, agentName);
     return;
   }
 
   try {
-    // Mark as received first
-    await markMessageReceived(client, message.id, agentName);
+    // Atomically claim the message. Only the first worker/call creates the row.
+    const claim = await claimMessage(client, message.id, agentName);
+    if (!claim) {
+      log?.debug?.(
+        `Message ${message.id} already claimed by another worker or a prior run; skipping dispatch`,
+      );
+      return;
+    }
     log?.debug?.(`Marked message ${message.id} as received`);
 
     // Build session label
@@ -421,9 +471,11 @@ export async function processAgentChatMessage({
     });
 
     // Create reply dispatcher that sends replies back to agent_chat table
+    let deliverFired = false;
     const { dispatcher, replyOptions, markDispatchIdle } =
       runtime.channel.reply.createReplyDispatcherWithTyping({
         deliver: async (payload, info) => {
+          deliverFired = true;
           try {
             await insertOutboundMessage(client, {
               sender: agentName,
@@ -466,7 +518,7 @@ export async function processAgentChatMessage({
     log?.info?.(`🚀 Dispatching message ${message.id} to agent...`);
 
     try {
-      await runtime.channel.reply.dispatchReplyFromConfig({
+      const dispatchResult = await runtime.channel.reply.dispatchReplyFromConfig({
         ctx: ctxPayload,
         cfg,
         dispatcher,
@@ -477,6 +529,41 @@ export async function processAgentChatMessage({
 
       log?.info?.(`✅ Successfully dispatched message ${message.id}`);
       await markMessageRouted(client, message.id, agentName);
+
+      // Wait for any async deliver() work to finish before deciding the final
+      // status. On OLD builds waitForIdle resolves void; on NEW builds it may
+      // resolve a ReplyDispatchReceipt, but the outcome is already reflected
+      // in deliverFired / deferredToActiveRun.
+      await dispatcher.waitForIdle();
+
+      if (deliverFired) {
+        // deliver() was invoked. It already set the status to responded
+        // (or failed on error). Nothing more to do.
+        return;
+      }
+
+      // NEW build: if the turn was deferred to an active run, leave it at
+      // routed for the digest to surface later.
+      const deferredToActiveRun = (
+        dispatchResult as { deferredToActiveRun?: "steer" | "followup" } | undefined
+      )?.deferredToActiveRun;
+      if (deferredToActiveRun) {
+        log?.debug?.(
+          `Message ${message.id} deferred to active run (${deferredToActiveRun}); keeping status routed`,
+        );
+        return;
+      }
+
+      // No deliver and not deferred: check whether a reply was sent through
+      // send_agent_message() directly (linked by reply_to).
+      const hasReply = await hasLinkedReply(client, message.id, agentName);
+      if (hasReply) {
+        log?.info?.(`Message ${message.id} has a linked reply; marking responded`);
+        await markMessageResponded(client, message.id, agentName);
+      } else {
+        log?.info?.(`Message ${message.id} finished with no reply; marking handled`);
+        await markMessageHandled(client, message.id, agentName);
+      }
     } catch (dispatchError) {
       log?.error?.(`❌ Dispatch error for message ${message.id}: ${dispatchError}`);
       await markMessageFailed(
