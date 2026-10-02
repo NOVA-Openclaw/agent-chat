@@ -1023,7 +1023,7 @@ _tc11x_send_as_b() {
 
     # Verify schema_version.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "5" ]
+    [ "$output" = "6" ]
 
     # Verify core objects.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"
