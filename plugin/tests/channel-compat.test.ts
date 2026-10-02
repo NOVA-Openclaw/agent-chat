@@ -7,11 +7,15 @@
 
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { PluginRuntime, OpenClawConfig } from "openclaw/plugin-sdk";
 import {
   formatAgentChatEnvelope,
   checkDeprecatedReplyFunctions,
   processAgentChatMessage,
+  resolveAgentNameFromPgConfig,
   type AgentChatEnvelopeInput,
 } from "../src/channel.js";
 import { setAgentChatRuntime } from "../src/runtime.js";
@@ -327,6 +331,40 @@ describe("TC-23-006: deprecated functions present are used normally", () => {
         q.params[0] === SAMPLE_MESSAGE.id,
     );
     assert.ok(routedUpdate, "expected a routed status update");
+  });
+});
+
+describe("TC-23-121: Req 1+2 compose on NEW-build-shaped runtime", () => {
+  it("resolved agent name comes from pgConfig.user and shim envelope still works", async () => {
+    const { loadPgEnv } = await import("../lib/pg-env.js");
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "tc23-121-"));
+    const configPath = path.join(tmpDir, "postgres.json");
+    fs.writeFileSync(
+      configPath,
+      JSON.stringify({ agent_chat: { user: "victoria", database: "agent_chat" } }),
+      "utf-8",
+    );
+
+    try {
+      const pgCfg = loadPgEnv(configPath, "agent_chat");
+      assert.strictEqual(pgCfg.user, "victoria");
+
+      const agentName = resolveAgentNameFromPgConfig(pgCfg);
+      assert.strictEqual(agentName, "victoria");
+
+      const runtime = makeNewRuntime();
+      const envelopeResult = formatAgentChatEnvelope(runtime, {}, {
+        sender: "nova",
+        message: "hello victoria",
+      });
+      assert.strictEqual(envelopeResult.ok, true);
+      assert.strictEqual(
+        (envelopeResult as { ok: true; body: string }).body,
+        "nova: hello victoria",
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 
