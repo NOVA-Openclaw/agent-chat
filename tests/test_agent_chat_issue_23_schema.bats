@@ -56,6 +56,37 @@ _issue23_psql_as() {
     psql -d "$db_name" -At -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION \"$role\"; $sql"
 }
 
+# Count rows the startup digest would surface for an agent.
+_issue23_digest_unresolved_count() {
+    local db_name="$1"
+    local agent="$2"
+    psql -d "$db_name" -At -v ON_ERROR_STOP=1 -c "
+        SELECT count(*)
+        FROM agent_chat ac
+        LEFT JOIN agent_chat_processed acp
+          ON ac.id = acp.chat_id AND LOWER(acp.agent) = LOWER('$agent')
+        WHERE (
+            LOWER('$agent') = ANY(SELECT LOWER(unnest(ac.recipients)))
+            OR '*' = ANY(ac.recipients)
+          )
+          AND (
+            acp.chat_id IS NULL
+            OR acp.status IN ('received', 'routed')
+          )
+    "
+}
+
+# Print the exact paging SQL the digest embeds for an agent.
+_issue23_digest_paging_query() {
+    local agent="$1"
+    local saved_cwd="$(pwd)"
+    cd "$REPO_ROOT/plugin" || return 1
+    ./node_modules/.bin/tsx tests/helpers/digest-paging-query.ts "$agent"
+    local rc=$?
+    cd "$saved_cwd" || true
+    return $rc
+}
+
 setup_file() {
     : > "$BATS_FILE_TMPDIR/issue23_roles.txt"
 }
@@ -433,6 +464,11 @@ teardown_file() {
     # Row is untouched.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status FROM public.agent_chat_processed WHERE chat_id = 390 AND agent = '$scout';"
     [ "$output" = "received" ]
+
+    # The startup digest (Requirement 5) surfaces received-only rows as unresolved.
+    run _issue23_digest_unresolved_count "$AGENT_CHAT_DB_NAME" "$scout"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
 }
 
 @test "TC-23-040: multi-agent received rows are isolated per agent" {
@@ -454,6 +490,49 @@ teardown_file() {
     [ "$status" -eq 0 ]
     [[ "$output" == *"$scout|received"* ]]
     [[ "$output" == *"$marcie|received"* ]]
+
+    # Digest isolation: each agent sees only its own received row.
+    run _issue23_digest_unresolved_count "$AGENT_CHAT_DB_NAME" "$scout"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+
+    run _issue23_digest_unresolved_count "$AGENT_CHAT_DB_NAME" "$marcie"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+# ─── Requirement 5 startup digest PG-layer cases ────────────────────────────
+
+@test "TC-23-061: paging query self-consistency" {
+    local flint
+    flint="$(_issue23_agent_name flint)"
+    _ISSUE23_ROLES=("$flint")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint"
+
+    # Seed 25 unresolved messages with stable, oldest-first timestamps.
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+        ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
+        INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
+            SELECT g, 'nova', 'msg ' || g, ARRAY['$flint'], '2026-09-01T00:00:00Z'::timestamptz + (g || ' seconds')::interval
+            FROM generate_series(1, 25) AS g;
+        SELECT setval('public.agent_chat_id_seq', 1000);
+    " >/dev/null
+
+    # Extract the literal paging SQL embedded by the digest.
+    run _issue23_digest_paging_query "$flint"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+    local paging_sql="$output"
+
+    # The query must return exactly the 5 rows beyond the 20-message cap.
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "$paging_sql"
+    [ "$status" -eq 0 ]
+    [ "$(printf '%s\n' "$output" | grep -c '^')" -eq 5 ]
+
+    # And those 5 rows must be ids 21-25 (the newest beyond the cap).
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT string_agg(id::text, ',' ORDER BY id) FROM (${paging_sql%;}) q;"
+    [ "$status" -eq 0 ]
+    [ "$output" = "21,22,23,24,25" ]
 }
 
 @test "TC-23-041: responded rows are never re-selected for dispatch" {
