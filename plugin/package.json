@@ -7,7 +7,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "test": "node --test-concurrency=1 --test tests/*.test.mjs",
+    "test": "tsx --test-concurrency=1 --test tests/*.test.ts lib/*.test.ts",
     "watch": "tsc --watch",
     "clean": "rm -rf dist"
   },
@@ -31,5 +31,7 @@
     "typescript": "^5.6.0",
     "zod": "^3.23.0"
   },
-  "devDependencies": {}
+  "devDependencies": {
+    "tsx": "^4.23.15"
+  }
 }

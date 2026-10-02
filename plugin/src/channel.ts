@@ -4,6 +4,7 @@ import type {
   OpenClawConfig,
   ChannelGatewayContext,
   ChannelMeta,
+  PluginRuntime,
 } from "openclaw/plugin-sdk";
 import { loadPgEnv } from "../lib/pg-env.js";
 import { getAgentChatRuntime } from "./runtime.js";
@@ -18,13 +19,179 @@ const { Client } = pg;
 const PLUGIN_ID = "agent_chat";
 
 /**
- * Resolve the agent name from the top-level OpenClaw config.
- * Uses agents.list to find the default agent, then falls back to id.
+ * Resolve the agent name from the agent_chat DB config user.
+ * The DB user is authoritative because send_agent_message() enforces
+ * sender = session_user; cfg.agents.list cannot be trusted on newer
+ * gateway builds where default markers are removed from the projection.
  */
-function resolveAgentName(cfg: OpenClawConfig): string {
-  const agents = cfg.agents?.list ?? [];
-  const defaultAgent = agents.find((a) => a.default) ?? agents[0];
-  return defaultAgent?.id ?? defaultAgent?.name ?? "main";
+export function resolveAgentNameFromPgConfig(pgCfg: { user?: string | null }): string {
+  const raw = pgCfg.user;
+  if (!raw) {
+    return "";
+  }
+  return String(raw).toLowerCase();
+}
+
+export function resolveAgentName(_cfg?: OpenClawConfig): string {
+  return resolveAgentNameFromPgConfig(pgConfig);
+}
+
+/** Result of validating the agent_chat plugin configuration. */
+export type AgentChatConfigValidation =
+  | { ok: true; agentName: string }
+  | { ok: false; error: string };
+
+/**
+ * Validate that the plugin has enough configuration to start monitoring.
+ * The agent name is derived from pgConfig.user, not from cfg.agents.list.
+ */
+export function validateAgentChatConfig(): AgentChatConfigValidation {
+  const agentName = resolveAgentName();
+  if (!agentName) {
+    return {
+      ok: false,
+      error:
+        "agent_chat: cannot start monitor — no agent name could be resolved from " +
+        "the DB config (pgConfig.user). Please set agent_chat.user in postgres.json " +
+        "or the PGUSER environment variable.",
+    };
+  }
+  return { ok: true, agentName };
+}
+
+/** Input to the inbound envelope formatter. */
+export interface AgentChatEnvelopeInput {
+  channel: string;
+  from: string;
+  timestamp?: number;
+  body: string;
+  chatType: "direct" | "group";
+  sender: { name: string; id: string };
+  envelope: unknown;
+}
+
+/** Result of attempting to format an inbound envelope. */
+export type AgentChatEnvelopeResult =
+  | { ok: true; body: string }
+  | { ok: false; error: string };
+
+/**
+ * Format an inbound envelope, feature-detecting the gateway build.
+ *
+ * OLD build (<= 436c9a3): `runtime.channel.reply.formatInboundEnvelope` is
+ * present and used directly.
+ *
+ * NEW build (>= d6c4379): `formatInboundEnvelope` is removed from the plugin
+ * runtime surface. Fall back to `formatAgentEnvelope` with a shim body of
+ * `"${sender}: ${body}"`, which matches the OLD build's output for direct
+ * chats.
+ */
+export function formatAgentChatEnvelope(
+  runtime: PluginRuntime,
+  cfg: OpenClawConfig,
+  message: {
+    sender: string;
+    message: string;
+    timestamp?: Date | string | number | null;
+  },
+): AgentChatEnvelopeResult {
+  const replyApi = runtime.channel?.reply;
+  if (!replyApi) {
+    return { ok: false, error: "runtime.channel.reply is not available" };
+  }
+
+  const envelopeOptions =
+    typeof replyApi.resolveEnvelopeFormatOptions === "function"
+      ? replyApi.resolveEnvelopeFormatOptions(cfg)
+      : {};
+
+  const timestampMs = message.timestamp
+    ? new Date(message.timestamp).getTime()
+    : undefined;
+
+  const baseInput = {
+    channel: "AgentChat",
+    from: `${message.sender}`,
+    timestamp: timestampMs,
+    chatType: "direct" as const,
+    sender: { name: message.sender, id: message.sender },
+    envelope: envelopeOptions,
+  };
+
+  if (typeof replyApi.formatInboundEnvelope === "function") {
+    try {
+      const body = replyApi.formatInboundEnvelope({
+        ...baseInput,
+        body: message.message,
+      });
+      return { ok: true, body };
+    } catch (err) {
+      return {
+        ok: false,
+        error: `formatInboundEnvelope threw: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  if (typeof replyApi.formatAgentEnvelope === "function") {
+    try {
+      const shimBody = `${message.sender}: ${message.message}`;
+      const body = replyApi.formatAgentEnvelope({
+        ...baseInput,
+        body: shimBody,
+      });
+      return { ok: true, body };
+    } catch (err) {
+      return {
+        ok: false,
+        error: `formatAgentEnvelope shim threw: ${(err as Error).message}`,
+      };
+    }
+  }
+
+  return {
+    ok: false,
+    error:
+      "Neither formatInboundEnvelope nor formatAgentEnvelope is available on runtime.channel.reply",
+  };
+}
+
+/** Result of checking that deprecated reply functions still exist. */
+export type DeprecatedReplyFunctionsCheck =
+  | { ok: true }
+  | { ok: false; error: string; missing: string[] };
+
+/**
+ * Feature-detect the deprecated runtime functions the plugin still depends on.
+ * These are marked `removeAfter: 2026-10-01` on newer gateway builds. If any
+ * are missing the message must be marked failed, never allowed to throw an
+ * unhandled TypeError.
+ */
+export function checkDeprecatedReplyFunctions(
+  runtime: PluginRuntime,
+): DeprecatedReplyFunctionsCheck {
+  const replyApi = runtime.channel?.reply;
+  const missing: string[] = [];
+
+  if (typeof replyApi?.finalizeInboundContext !== "function") {
+    missing.push("finalizeInboundContext");
+  }
+  if (typeof replyApi?.createReplyDispatcherWithTyping !== "function") {
+    missing.push("createReplyDispatcherWithTyping");
+  }
+  if (typeof replyApi?.dispatchReplyFromConfig !== "function") {
+    missing.push("dispatchReplyFromConfig");
+  }
+
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      error: `runtime.channel.inbound.dispatch not yet wired / required functions removed: ${missing.join(", ")}`,
+      missing,
+    };
+  }
+
+  return { ok: true };
 }
 
 // Manual meta definition since "agent_chat" is not in the core channel allowlist
@@ -205,18 +372,32 @@ export async function processAgentChatMessage({
     // Build session label
     const sessionLabel = buildSessionLabel({ agentName });
 
-    // Format the inbound message envelope
-    const envelopeOptions = runtime.channel.reply.resolveEnvelopeFormatOptions(cfg);
-    const fromLabel = `${message.sender}`;
-    const body = runtime.channel.reply.formatInboundEnvelope({
-      channel: "AgentChat",
-      from: fromLabel,
-      timestamp: message.timestamp ? new Date(message.timestamp).getTime() : undefined,
-      body: message.message,
-      chatType: "direct",
-      sender: { name: message.sender, id: message.sender },
-      envelope: envelopeOptions,
+    // Format the inbound message envelope with build-aware feature detection.
+    const envelopeResult = formatAgentChatEnvelope(runtime, cfg, {
+      sender: message.sender,
+      message: message.message,
+      timestamp: message.timestamp,
     });
+
+    if (!envelopeResult.ok) {
+      log?.error?.(
+        `agent_chat: envelope formatting failed for message ${message.id}: ${envelopeResult.error}`,
+      );
+      await markMessageFailed(client, message.id, agentName, envelopeResult.error);
+      return;
+    }
+
+    const body = envelopeResult.body;
+
+    // Feature-detect the deprecated reply functions before calling them.
+    const funcCheck = checkDeprecatedReplyFunctions(runtime);
+    if (!funcCheck.ok) {
+      log?.error?.(`agent_chat: ${funcCheck.error}`);
+      await markMessageFailed(client, message.id, agentName, funcCheck.error);
+      return;
+    }
+
+    const fromLabel = `${message.sender}`;
 
     // Build the inbound context
     const agentChatTo = `agent_chat:${agentName}`;
@@ -319,16 +500,14 @@ async function startAgentChatMonitor(
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>,
 ): Promise<void> {
   const { pollIntervalMs } = ctx.account.config;
-  const agentName = resolveAgentName(ctx.cfg);
   const log = ctx.log;
 
-  if (!agentName) {
-    log?.error?.(
-      `agent_chat: cannot start monitor — no agent name found in top-level config (agents.list). ` +
-      `Please configure agents.list with at least one agent entry that has an id or name.`,
-    );
-    return;
+  const validation = validateAgentChatConfig();
+  if (!validation.ok) {
+    log?.error?.(validation.error);
+    throw new Error(validation.error);
   }
+  const agentName = validation.agentName;
 
   log?.info?.(`Starting monitor for agent: ${agentName}`);
 
@@ -573,7 +752,7 @@ export const agentChatPlugin: ChannelPlugin<ResolvedAgentChatAccount> = {
         const agentName = resolveAgentName(cfg);
         if (!agentName) {
           throw new Error(
-            `agent_chat: cannot send — no agent name found in top-level config (agents.list)`,
+            `agent_chat: cannot send — no agent name could be resolved from DB config (pgConfig.user)`,
           );
         }
 
