@@ -34,6 +34,7 @@ RETURNS void
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
     IF p_chat_ids IS NULL THEN
@@ -98,6 +99,7 @@ CREATE OR REPLACE FUNCTION public.send_agent_message(
 RETURNS integer
 LANGUAGE plpgsql
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_id             INTEGER;

@@ -316,6 +316,7 @@ RETURNS void
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 BEGIN
     IF p_chat_ids IS NULL THEN
@@ -382,6 +383,7 @@ RETURNS integer
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_id             INTEGER;
