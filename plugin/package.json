@@ -7,6 +7,7 @@
   "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
+    "lint": "tsc --noEmit",
     "test": "tsx --test-concurrency=1 --test tests/*.test.ts lib/*.test.ts",
     "watch": "tsc --watch",
     "clean": "rm -rf dist"
