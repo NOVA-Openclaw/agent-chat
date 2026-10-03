@@ -21,9 +21,26 @@ ALTER TABLE public.agent_chat_processed
     ADD COLUMN IF NOT EXISTS expired_at timestamp;
 
 -- ─── Requirement 6: mark_agent_chat_status ────────────────────────────────
--- SECURITY DEFINER function that lets an agent mark its own rows as terminal
--- ('handled' or 'expired'). Cross-agent ids and missing ids are silently
--- ignored (partial success, no error). Terminal statuses never regress.
+-- SECURITY DEFINER function that lets an agent mark its own agent_chat_processed
+-- rows as terminal ('handled' or 'expired').
+--
+-- Authorization rule (mirrors send_agent_message reply_to authorization):
+-- the caller may mark a message only if they are a named recipient of it
+-- (case-insensitive) OR the message is a broadcast ('*' in recipients).
+--
+-- If no processed row exists for (chat_id, caller) yet, one is created with the
+-- requested terminal status. This closes the gap where messages never picked up
+-- (or broadcasts, deliberately excluded from migration 007) would otherwise
+-- reappear in every startup digest forever.
+--
+-- Race safety: claimMessage may insert a 'received' row concurrently. We use
+-- INSERT ... ON CONFLICT (chat_id, agent) DO NOTHING, then the guarded UPDATE.
+-- If the insert lost the race, the update still applies. If the insert won,
+-- the row already has the requested terminal status and the update is a no-op.
+--
+-- Cross-agent ids, missing ids, and messages the caller is not authorized to
+-- mark are silently ignored (partial success, no error). Terminal statuses
+-- never regress.
 DROP FUNCTION IF EXISTS public.mark_agent_chat_status(bigint[], text);
 
 CREATE OR REPLACE FUNCTION public.mark_agent_chat_status(
@@ -53,8 +70,34 @@ BEGIN
         RAISE EXCEPTION 'mark_agent_chat_status: status must be "handled" or "expired" (got %)', p_status;
     END IF;
 
-    -- Only touch rows owned by the calling session user, and never flip an
-    -- already-terminal status. Missing ids or other agents' rows are ignored.
+    -- Step 1: create a processed row for authorized messages when none exists.
+    -- Authorization is enforced here; non-recipients and non-broadcasts are
+    -- skipped because the JOIN to agent_chat will not match.
+    IF p_status = 'handled' THEN
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at)
+        SELECT ac.id, session_user, 'handled', NOW()
+        FROM public.agent_chat ac
+        WHERE ac.id = ANY(p_chat_ids)
+          AND (
+              session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
+              OR '*' = ANY(ac.recipients)
+          )
+        ON CONFLICT (chat_id, agent) DO NOTHING;
+    ELSIF p_status = 'expired' THEN
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, expired_at)
+        SELECT ac.id, session_user, 'expired', NOW()
+        FROM public.agent_chat ac
+        WHERE ac.id = ANY(p_chat_ids)
+          AND (
+              session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
+              OR '*' = ANY(ac.recipients)
+          )
+        ON CONFLICT (chat_id, agent) DO NOTHING;
+    END IF;
+
+    -- Step 2: update any existing own rows that are not yet terminal. This
+    -- covers pre-existing non-terminal rows and rows inserted concurrently by
+    -- claimMessage with status 'received'.
     IF p_status = 'handled' THEN
         UPDATE public.agent_chat_processed
         SET status = 'handled',

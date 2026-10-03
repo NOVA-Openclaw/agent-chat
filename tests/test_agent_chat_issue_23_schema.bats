@@ -589,3 +589,147 @@ teardown_file() {
     # data with a pipe separator.
     [[ "$output" != *"|"* ]]
 }
+
+# ─── Requirement 6 follow-up: Option A (mark_agent_chat_status creates row) ─
+
+@test "TC-23-090a: named recipient with no processed row gets one created" {
+    local flint quill
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    _ISSUE23_ROLES=("$flint" "$quill")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (700, '$quill', 'to flint', ARRAY['$flint']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[700], 'handled'); SELECT status || '|' || (handled_at IS NOT NULL) FROM public.agent_chat_processed WHERE chat_id = 700 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"handled|t"* ]]
+}
+
+@test "TC-23-090b: broadcast with no processed row gets one created" {
+    local flint nova
+    flint="$(_issue23_agent_name flint)"
+    nova="$(_issue23_agent_name nova)"
+    _ISSUE23_ROLES=("$flint" "$nova")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$nova"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (701, '$nova', 'broadcast', ARRAY['*']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[701], 'expired'); SELECT status || '|' || (expired_at IS NOT NULL) FROM public.agent_chat_processed WHERE chat_id = 701 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"expired|t"* ]]
+}
+
+@test "TC-23-090c: non-recipient non-broadcast message is silently ignored" {
+    local flint quill ticker
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    ticker="$(_issue23_agent_name ticker)"
+    _ISSUE23_ROLES=("$flint" "$quill" "$ticker")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill" "$ticker"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (702, '$quill', 'to flint', ARRAY['$flint']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$ticker" "SELECT mark_agent_chat_status(ARRAY[702], 'handled');"
+    [ "$status" -eq 0 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 702;"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+@test "TC-23-090d: existing terminal row is unchanged" {
+    local flint quill
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    _ISSUE23_ROLES=("$flint" "$quill")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (703, '$quill', 'to flint', ARRAY['$flint']); INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at) VALUES (703, '$flint', 'handled', NOW()); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[703], 'expired'); SELECT status || '|' || (expired_at IS NOT NULL) FROM public.agent_chat_processed WHERE chat_id = 703 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"handled|f"* ]]
+}
+
+@test "TC-23-090e: mixed array applies only to authorized, non-terminal rows" {
+    local flint quill ticker
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    ticker="$(_issue23_agent_name ticker)"
+    _ISSUE23_ROLES=("$flint" "$quill" "$ticker")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill" "$ticker"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
+        INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES
+            (704, '$quill', 'to flint', ARRAY['$flint']),
+            (705, '$quill', 'to ticker', ARRAY['$ticker']),
+            (706, '$quill', 'broadcast', ARRAY['*']);
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at) VALUES
+            (706, '$flint', 'handled', NOW());
+        SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[704,705,706,999999], 'expired');"
+    [ "$status" -eq 0 ]
+
+    # 704: authorized, no row -> created expired
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || (expired_at IS NOT NULL) FROM public.agent_chat_processed WHERE chat_id = 704 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"expired|t"* ]]
+
+    # 705: not authorized -> no row for flint
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 705 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+
+    # 706: authorized broadcast but already terminal -> unchanged
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || (expired_at IS NOT NULL) FROM public.agent_chat_processed WHERE chat_id = 706 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"handled|f"* ]]
+
+    # 999999: nonexistent -> no row
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 999999;"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
+
+@test "TC-23-090f: running twice on no-row message is idempotent" {
+    local flint quill
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    _ISSUE23_ROLES=("$flint" "$quill")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (707, '$quill', 'to flint', ARRAY['$flint']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[707], 'handled');"
+    [ "$status" -eq 0 ]
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[707], 'handled');"
+    [ "$status" -eq 0 ]
+
+    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 707 AND agent = '$flint';"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+}
+
+@test "TC-23-090g: marking removes a never-picked-up message from fetchUnresolvedMessages" {
+    local flint quill
+    flint="$(_issue23_agent_name flint)"
+    quill="$(_issue23_agent_name quill)"
+    _ISSUE23_ROLES=("$flint" "$quill")
+    _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$flint" "$quill"
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use; INSERT INTO public.agent_chat (id, sender, message, recipients) VALUES (708, '$quill', 'to flint', ARRAY['$flint']); SELECT setval('public.agent_chat_id_seq', 1000);" >/dev/null
+
+    run _issue23_digest_unresolved_count "$AGENT_CHAT_DB_NAME" "$flint"
+    [ "$status" -eq 0 ]
+    [ "$output" = "1" ]
+
+    run _issue23_psql_as "$AGENT_CHAT_DB_NAME" "$flint" "SELECT mark_agent_chat_status(ARRAY[708], 'handled');"
+    [ "$status" -eq 0 ]
+
+    run _issue23_digest_unresolved_count "$AGENT_CHAT_DB_NAME" "$flint"
+    [ "$status" -eq 0 ]
+    [ "$output" = "0" ]
+}
