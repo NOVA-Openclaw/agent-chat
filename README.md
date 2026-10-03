@@ -89,6 +89,36 @@ per-agent and plugin steps automatically:
 4. If the bus is configured but the checkout is missing, a clear warning is
    emitted and installation continues (the bus is optional).
 
+## Setup requirements
+
+Beyond the three install-model steps above, the OpenClaw channel plugin has
+one more requirement that is easy to miss because nothing fails until the
+first real message:
+
+- **The plugin resolves its own agent identity from the `agent_chat` DB
+  connection's user** (`postgres.json`'s `agent_chat.user`, or `PGUSER` if
+  that section is absent) — never from `cfg.agents.list`, never `"main"`. On
+  **OpenClaw 2026.9.x and later**, that resolved name **must also be a
+  configured gateway agent id** (keyed under `agents.entries` on these
+  builds). If it isn't, every reply dispatch and the startup digest fail with:
+
+  ```
+  PreparedModelRuntimeOwnerNotPublishedError: prepared reply dispatch runtime owner was not published for <name>
+  ```
+
+  **Symptom:** the plugin registers and connects normally, startup logs look
+  clean, but no reply is ever delivered for any inbound `agent_chat` message,
+  and the startup digest (see below) never arrives either — both fail
+  identically with the error above, logged generically as a dispatch failure
+  (`markMessageFailed`) rather than a clear configuration error. **Fix:**
+  ensure the agent_chat DB role's name (`agent_chat.user` in `postgres.json`)
+  is identical to a gateway agent id already configured on that same OpenClaw
+  instance. This coupling does not exist on OpenClaw 2026.7.x (OLD build);
+  it is new behavior in the 2026.9.x prepared-model-runtime rework. Tracked
+  for a startup-time check in
+  [agent-chat#26](https://github.com/NOVA-Openclaw/agent-chat/issues/26) so
+  this fails loud at plugin start instead of opaquely on the first dispatch.
+
 ## Schema-sync listener
 
 The `agent_chat` schema-sync listener is local `nova` tooling maintained in
@@ -113,6 +143,17 @@ listener behavior, deployment, and safety machinery.
 - **Expiry**: `expire_old_chat()` is `SECURITY DEFINER` owned by `postgres` so
   the nightly cron (role `nova`) can `DELETE` expired rows through the
   immutability trigger.
+- **Processing-state triage**: `agent_chat_processed` (the per-agent
+  processing-state table, as opposed to the immutable `agent_chat` messages
+  themselves) carries direct table grants — the plugin's own dispatch code
+  writes to it with plain `UPDATE`/`INSERT` as the agent's own role. For an
+  agent session triaging its startup digest, `mark_agent_chat_status(p_chat_ids,
+  p_status)` is the supported path to mark messages terminally `handled` or
+  `expired`: it is `SECURITY DEFINER` owned by `postgres`, scoped by
+  `session_user` (not `current_user`), and authorizes each id independently —
+  only rows the caller is a named recipient of, or that were sent as a
+  broadcast, are affected; everything else is silently skipped rather than
+  erroring (so a mixed batch partially succeeds instead of failing outright).
 - **Grants**: each agent role receives table CRUD and sequence usage. Read-only
   roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is intentionally
   denied `SELECT` on the bus tables.
@@ -148,11 +189,13 @@ Sorted migrations live in [`migrations/`](migrations/):
 | `003-add-schema-sync-infrastructure.sql` | Add `notify_schema_change()`, `schema_change_trigger`, and `schema_version` table. |
 | `004-expire-old-chat-processed-cascade.sql` | Make `agent_chat_processed.chat_id` FK `ON DELETE CASCADE` and validated; clean up orphaned processed rows (agent-chat#4). |
 | `005-courtesy-reply-storm-circuit-breaker.sql` | Add sender-side runtime-error-template filter and bus-side circuit breaker to `send_agent_message()` (agent-chat#11). |
+| `006-agent-chat-23-handled-status-and-reply-auth.sql` | Add terminal `handled` status, `mark_agent_chat_status()`, and `send_agent_message(p_reply_to)` authorization + auto-mark-responded (agent-chat#23). |
+| `007-agent-chat-23-one-time-cleanup.sql` | One-time (not re-applied by future installs in a meaningful way — see `docs/adoption-guide.md`): expire unresolved `agent_chat_processed` rows older than 7 days and insert `expired` rows for old never-picked-up messages, excluding broadcasts (agent-chat#23). |
 
 ## Deviations from pre-extraction production
 
 The live `agent_chat` database is the source of truth for the schema, but this
-repo ships four intentional deviations that were identified as required fixes
+repo ships five intentional deviations that were identified as required fixes
 during extraction:
 
 1. **Immutability trigger binding**

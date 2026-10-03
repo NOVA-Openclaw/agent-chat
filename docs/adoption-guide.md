@@ -18,9 +18,10 @@ An adoption run is different. The live pre-extraction database has:
 
 - **No `schema_version` table** — this repo's version handshake did not
   exist before the extraction, so `install.sh`'s idempotency check
-  (`_is_up_to_date`, which looks for `schema_version` MAX = 3) will correctly
-  treat an unmigrated production DB as needing the full schema + migrations
-  applied.
+  (`_is_up_to_date`, which compares `schema_version` MAX against
+  `_get_expected_version` — the highest numeric prefix among files in
+  `migrations/`, currently 7) will correctly treat an unmigrated production DB
+  as needing the full schema + migrations applied.
 - **The old, broken trigger binding** — `trg_enforce_agent_chat_function_use`
   bound to `BEFORE INSERT` only (not `UPDATE`/`DELETE`). See
   [docs/security-model.md](security-model.md#historical-defect-this-fixes)
@@ -32,10 +33,14 @@ An adoption run is different. The live pre-extraction database has:
 - **An existing, hand-maintained grant matrix** across every ecosystem agent
   role plus cross-ecosystem read-only consumers.
 
-The migration path (`schema.sql`'s idempotent apply, then
-`migrations/001` → `002` → `003` in sorted order) is designed to transition
-this exact starting state safely. This guide walks through what to verify
-before, during, and after.
+The migration path (`schema.sql`'s idempotent apply, then every file in
+`migrations/` in sorted order — `001` through `007` as of this writing) is
+designed to transition this exact starting state safely. The adoption-specific
+concerns below center on `002` (the atomicity requirement) since that is the
+migration that first touches live DML-enforcement behavior; later migrations
+(`003`–`007`) are additive schema/function changes that carry the same general
+idempotency guarantees but not `002`'s specific cutover risk. This guide walks
+through what to verify before, during, and after.
 
 ## Before you run anything: back up
 
@@ -117,7 +122,7 @@ pg_restore -d agent_chat_rehearsal agent_chat-pre-adoption-YYYYMMDD.dump
 AGENT_CHAT_DB_NAME=agent_chat_rehearsal bash install.sh
 
 # 3. Verify.
-psql -d agent_chat_rehearsal -c "SELECT MAX(version) FROM schema_version;"   # expect 3
+psql -d agent_chat_rehearsal -c "SELECT MAX(version) FROM schema_version;"   # expect the current highest migrations/ prefix (7 as of this writing)
 psql -d agent_chat_rehearsal -c "SELECT COUNT(*) FROM agent_chat;"          # compare to pre-migration count
 psql -d agent_chat_rehearsal -c "\d agent_chat"                              # confirm trigger binding
 ```
@@ -170,13 +175,14 @@ partial rollback of individual migration files.
 ## After a successful adoption run
 
 - Confirm `install.sh`'s idempotent re-run reports "up to date"
-  (`schema_version 3, all expected objects present`) rather than re-applying
-  anything.
+  (`schema_version <N>, all expected objects present`, where `<N>` is the
+  current highest numeric prefix in `migrations/` — 7 as of this writing)
+  rather than re-applying anything.
 - Run `register-agent.sh --check <agent_name>` for a few existing agents to
   confirm their roles/grants survived unchanged.
 - If nova-mind hosts on this cluster use peer-detection
   (see the main [README.md § Install model](../README.md#install-model)),
-  confirm the schema-version handshake reports version 3 as expected —
+  confirm the schema-version handshake reports the expected current version —
   though note
   [nova-mind#584](https://github.com/NOVA-Openclaw/nova-mind/issues/584)
   describes a known gap where the handshake silently no-ops on hosts where

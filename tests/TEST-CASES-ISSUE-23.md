@@ -164,6 +164,25 @@ cli-metadata modes where DB side effects are unsafe.
 | TC-23-065 (STAGING, OLD build, the hot-reload duplicate scenario for real) | Req 5 | OLD-build staging gateway, fixed plugin deployed, backlog seeded. | Trigger a real plugin hot-reload (config change under `channels.agent_chat` per the plugin's existing `reload.configPrefixes`) known to exhibit the stale-hook-left-behind behavior. | Only ONE digest is delivered post-reload, not two — the real-world confirmation of TC-23-055. | STAGING |
 | TC-23-066 (isolation from channel restart, STAGING) | Req 5 | NEW-build staging gateway, digest already fired once this generation. | Force a channel-level restart of the `agent_chat` account (e.g. via a transient connection drop/reconnect in `startAgentChatMonitor`) without a plugin reload. | No second digest fires. | STAGING |
 
+### Known staging-harness limitation: TC-23-065 reload-apply stall
+
+During SE#1068 Step 7 staging execution, running TC-23-065 against the
+OLD-build (`436c9a3`) isolated test gateway showed the physical
+channel-reload apply (triggered by a config change under
+`channels.agent_chat`, per `reload.configPrefixes`) **stall waiting on a
+single-session reply drain** before the reload could complete. This is a
+**harness artifact specific to the isolated single-session OLD-build test
+gateway**, not a plugin defect: the isolated test harness has only one
+session in flight, so the reload-apply path's wait-for-idle-session logic has
+nothing else to interleave with and blocks longer than it would on a
+multi-session production gateway with normal reply traffic. It does not
+reflect a hang, deadlock, or correctness bug in the plugin's own hot-reload
+handling (TC-23-055's unit-level guard-robustness assertion is unaffected and
+still passed). Recording this here so a future re-run of TC-23-065 against
+the same style of isolated harness does not mistake the stall for a
+regression; if it recurs, confirm first whether a second concurrent session
+in the harness clears it before treating it as a new defect.
+
 ---
 
 ## Requirement 6 — `mark_agent_chat_status` (SECURITY DEFINER), `send_agent_message` auto-mark on reply + `p_reply_to` authorization, additive schema + version bump

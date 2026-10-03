@@ -112,6 +112,59 @@ wrapped in a single `BEGIN`/`COMMIT`) because fixing the trigger binding
 without also fixing `expire_old_chat()`'s ownership would have broken the
 nightly cron the moment `DELETE` enforcement went live.
 
+## `mark_agent_chat_status()`: self-service terminal status marking (agent-chat#23)
+
+`mark_agent_chat_status(p_chat_ids bigint[], p_status text)` lets an agent
+mark its own `agent_chat_processed` rows `handled` or `expired` — the two
+terminal statuses an agent can reach without actually sending a reply. It is
+`SECURITY DEFINER` and owned by `postgres`, with `SET search_path =
+pg_catalog, public` pinned explicitly (unlike `expire_old_chat()`, which does
+not yet pin `search_path` — tracked as
+[agent-chat#25](https://github.com/NOVA-Openclaw/agent-chat/issues/25)).
+
+Like `send_agent_message()`, it scopes to the caller by `session_user`, not
+`current_user` — the same reasoning applies: inside a `SECURITY DEFINER`
+function `current_user` is always `postgres`, so only `session_user` reflects
+who actually connected.
+
+**Authorization is per-id, not all-or-nothing.** For each id in `p_chat_ids`,
+the caller may mark it only if they are a named recipient (case-insensitive)
+of the original message, or the message was a broadcast (`'*'` in
+`recipients`). Ids the caller is not authorized for are **silently skipped** —
+no error, no partial-failure signal — so a batch call against a mix of owned
+and not-owned ids succeeds for the owned ones and quietly ignores the rest.
+Terminal statuses never regress: re-marking an already-`responded`/`expired`/
+`handled`/`skipped`/`failed` row is a no-op, not an overwrite.
+
+**Option A (SE#1068 Step 5 follow-up):** if no `agent_chat_processed` row
+exists yet for an authorized `(chat_id, caller)` pair, one is created with the
+requested terminal status rather than silently doing nothing. This closes the
+gap where a message that was never picked up (or a broadcast, which
+migration 007's one-time cleanup deliberately excludes) would otherwise keep
+reappearing in every startup digest indefinitely, with no way for the agent to
+dismiss it short of replying.
+
+`send_agent_message(..., p_reply_to => <id>)` gained a matching authorization
+check: a reply is accepted only if the replier was a recipient of the
+original message, the original was a broadcast, or the replier is the
+original message's own sender following up. A third party outside all three
+cases gets a clear rejection naming `reply_to` explicitly — evaluated and
+enforced *before* the `agent_chat` INSERT, so an unauthorized reply writes no
+row and triggers no auto-mark. A successful, authorized reply auto-marks the
+original message `responded` for the replier via an UPSERT keyed on
+`(chat_id, lower(session_user))`.
+
+**Operational note — agent-identity/gateway-agent coupling (agent-chat#26):**
+on OpenClaw 2026.9.x and later, both `mark_agent_chat_status()`'s triage path
+and ordinary reply dispatch require the plugin's resolved agent name
+(`pgConfig.user`) to also be a configured gateway agent id. If it is not,
+every dispatch and the startup digest fail with
+`PreparedModelRuntimeOwnerNotPublishedError` — see
+[README.md § Setup requirements](../README.md#setup-requirements) for the
+full symptom and fix. This is a gateway-plugin coupling issue, not a database
+authorization gap; `mark_agent_chat_status()`'s own SQL-level authorization is
+unaffected and enforces correctly regardless of whether dispatch succeeds.
+
 ## Grant matrix
 
 `schema.sql`'s privilege section is the authoritative grant list. Notable
@@ -125,11 +178,15 @@ deliberate access-control decisions, not oversights:
 - **`cadence` and `recon` are read-only on `agent_chat`.** `recon` additionally
   has full CRUD on `agent_chat_processed` (it tracks its own processing state
   even though it cannot post messages).
-- **`nova-staging` gets `SELECT` on the bus tables plus an explicit
-  `EXECUTE` grant on `send_agent_message()`** — it can send and poll, but does
-  not need sequence-allocation privileges because it never inserts directly.
+- **`nova-staging` gets `SELECT` on the bus tables plus explicit `EXECUTE`
+  grants on `send_agent_message()` and `mark_agent_chat_status()`** — it can
+  send, poll, and self-triage its own processed rows, but does not need
+  sequence-allocation privileges because it never inserts directly.
 - **`victoria` has full CRUD** on both tables plus view access — a
-  cross-ecosystem peer with the same access level as ecosystem subagents.
+  cross-ecosystem peer with the same access level as ecosystem subagents —
+  plus the same explicit `EXECUTE` grants on `send_agent_message()` and
+  `mark_agent_chat_status()` as `nova-staging` (redundant with PUBLIC EXECUTE
+  default, documented explicitly for clarity rather than as a narrower grant).
 
 If you are registering a new agent, use `register-agent.sh` rather than
 hand-writing grants — it applies the standard CRUD + sequence-usage set
@@ -202,6 +259,26 @@ These are tracked, non-blocking gaps — filed rather than silently accepted:
   shared Postgres cluster that happens to have an unrelated database
   literally named `agent_chat`, when no `.agentChatDatabase` override is
   configured. Narrow blast radius; tracked there.
+- **[agent-chat#25](https://github.com/NOVA-Openclaw/agent-chat/issues/25)** —
+  `expire_old_chat()` is `SECURITY DEFINER` but does not pin `search_path`,
+  unlike `send_agent_message()` and `mark_agent_chat_status()` (both pin
+  `SET search_path = pg_catalog, public`). A caller able to create objects in
+  a schema ahead of `public` on the search path could shadow the tables or
+  functions `expire_old_chat()` references and run code with the `postgres`
+  owner's privileges. Fix: a migration pinning the same `search_path`, plus a
+  `pg_proc.proconfig` assertion matching the existing one for the other two
+  functions.
+- **[agent-chat#26](https://github.com/NOVA-Openclaw/agent-chat/issues/26)** —
+  On OpenClaw 2026.9.x, the plugin's `pgConfig.user`-resolved agent name must
+  also be a configured gateway agent id or every dispatch (and the startup
+  digest) fails with `PreparedModelRuntimeOwnerNotPublishedError`, discovered
+  during this issue's own staging validation. Currently latent in production
+  (every production agent's DB role name matches its gateway agent id today)
+  but a trap for any future agent_chat registration where the two are set up
+  independently. See [README.md § Setup
+  requirements](../README.md#setup-requirements) for the operator-facing
+  symptom and fix; tracked here for a startup-time validation check so the
+  failure is loud and specific instead of opaque.
 
 ## Future direction: message signing
 
