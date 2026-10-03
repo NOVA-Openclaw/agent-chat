@@ -1,8 +1,11 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createRequire } from "node:module";
-import { agentChatPlugin } from "./src/channel.js";
+import pg from "pg";
+import { agentChatPlugin, resolveAgentName } from "./src/channel.js";
 import { setAgentChatRuntime } from "./src/runtime.js";
 import { AgentChatConfigSchema } from "./src/config.js";
+import { createStartupDigestService } from "./src/digest.js";
+import { loadPgEnv } from "./lib/pg-env.js";
 
 const plugin = {
   id: "agent_chat",
@@ -28,6 +31,22 @@ const plugin = {
 
     setAgentChatRuntime(api.runtime);
     api.registerChannel({ plugin: agentChatPlugin });
+
+    // --- Startup digest service: only registered in full registration mode ---
+    // register() runs in discovery/setup/cli-metadata modes where DB side effects
+    // are unsafe. The digest is registered as a service so it fires from
+    // registerService.start on gateway load and plugin reload.
+    const registrationMode = (api as unknown as Record<string, unknown>).registrationMode;
+    if (registrationMode === "full") {
+      const pgConfig = loadPgEnv(undefined, "agent_chat");
+      const digestService = createStartupDigestService({
+        runtime: api.runtime,
+        resolveAgentName,
+        createClient: () => new pg.Client(pgConfig),
+      });
+      api.registerService(digestService);
+      log.debug?.("agent_chat: registered startup digest service");
+    }
 
     // --- Post-registration self-check ---
     const hasOutbound = typeof agentChatPlugin.outbound?.sendText === "function";

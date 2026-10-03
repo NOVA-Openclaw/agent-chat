@@ -43,7 +43,8 @@ BEGIN
             'responded',
             'failed',
             'expired',
-            'skipped'
+            'skipped',
+            'handled'
         );
     END IF;
 END $$;
@@ -80,6 +81,8 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_processed (
     received_at timestamp,
     routed_at timestamp,
     responded_at timestamp,
+    handled_at timestamp,
+    expired_at timestamp,
     error_message text,
     status public.agent_chat_status DEFAULT 'responded'::public.agent_chat_status,
     CONSTRAINT agent_chat_processed_pkey PRIMARY KEY (chat_id, agent)
@@ -298,6 +301,109 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_suppressed_log (
 CREATE INDEX IF NOT EXISTS idx_agent_chat_suppressed_log_time
     ON public.agent_chat_suppressed_log (suppressed_at DESC);
 
+-- Name: mark_agent_chat_status(bigint[], text); Type: FUNCTION; Schema: public; Owner: -
+-- SECURITY DEFINER function that lets an agent mark its own agent_chat_processed
+-- rows as terminal ('handled' or 'expired').
+--
+-- Authorization rule (mirrors send_agent_message reply_to authorization):
+-- the caller may mark a message only if they are a named recipient of it
+-- (case-insensitive) OR the message is a broadcast ('*' in recipients).
+--
+-- If no processed row exists for (chat_id, caller) yet, one is created with the
+-- requested terminal status. This closes the gap where messages never picked up
+-- (or broadcasts, deliberately excluded from migration 007) would otherwise
+-- reappear in every startup digest forever.
+--
+-- Race safety: claimMessage may insert a 'received' row concurrently. We use
+-- INSERT ... ON CONFLICT (chat_id, agent) DO NOTHING, then the guarded UPDATE.
+-- If the insert lost the race, the update still applies. If the insert won,
+-- the row already has the requested terminal status and the update is a no-op.
+--
+-- Cross-agent ids, missing ids, and messages the caller is not authorized to
+-- mark are silently ignored (partial success, no error). Terminal statuses
+-- never regress.
+DROP FUNCTION IF EXISTS public.mark_agent_chat_status(bigint[], text);
+
+CREATE OR REPLACE FUNCTION public.mark_agent_chat_status(
+    p_chat_ids bigint[],
+    p_status text
+)
+RETURNS void
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+BEGIN
+    IF p_chat_ids IS NULL THEN
+        RAISE EXCEPTION 'mark_agent_chat_status: p_chat_ids cannot be NULL';
+    END IF;
+
+    IF p_status IS NULL OR trim(p_status) = '' THEN
+        RAISE EXCEPTION 'mark_agent_chat_status: p_status cannot be NULL or empty';
+    END IF;
+
+    IF p_status NOT IN ('handled', 'expired') THEN
+        -- Valid enum labels that are not allowed get our own clear error;
+        -- non-existent labels (e.g. 'foo') fail naturally with the PostgreSQL
+        -- invalid-input-value error for the enum type.
+        PERFORM p_status::public.agent_chat_status;
+        RAISE EXCEPTION 'mark_agent_chat_status: status must be "handled" or "expired" (got %)', p_status;
+    END IF;
+
+    -- Step 1: create a processed row for authorized messages when none exists.
+    -- Authorization is enforced here; non-recipients and non-broadcasts are
+    -- skipped because the JOIN to agent_chat will not match.
+    IF p_status = 'handled' THEN
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at)
+        SELECT ac.id, session_user, 'handled', NOW()
+        FROM public.agent_chat ac
+        WHERE ac.id = ANY(p_chat_ids)
+          AND (
+              session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
+              OR '*' = ANY(ac.recipients)
+          )
+        ON CONFLICT (chat_id, agent) DO NOTHING;
+    ELSIF p_status = 'expired' THEN
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, expired_at)
+        SELECT ac.id, session_user, 'expired', NOW()
+        FROM public.agent_chat ac
+        WHERE ac.id = ANY(p_chat_ids)
+          AND (
+              session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
+              OR '*' = ANY(ac.recipients)
+          )
+        ON CONFLICT (chat_id, agent) DO NOTHING;
+    END IF;
+
+    -- Step 2: update any existing own rows that are not yet terminal. This
+    -- covers pre-existing non-terminal rows and rows inserted concurrently by
+    -- claimMessage with status 'received'.
+    IF p_status = 'handled' THEN
+        UPDATE public.agent_chat_processed
+        SET status = 'handled',
+            handled_at = NOW()
+        WHERE chat_id = ANY(p_chat_ids)
+          AND agent = session_user
+          AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed');
+    ELSIF p_status = 'expired' THEN
+        UPDATE public.agent_chat_processed
+        SET status = 'expired',
+            expired_at = NOW()
+        WHERE chat_id = ANY(p_chat_ids)
+          AND agent = session_user
+          AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed');
+    END IF;
+END;
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.mark_agent_chat_status(bigint[], text) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Skipping mark_agent_chat_status owner assignment: current user is not a superuser';
+END $$;
+
 -- Name: send_agent_message(text, text, text[], interval, integer); Type: FUNCTION; Schema: public; Owner: -
 -- Defensive drop of all known historical signatures before CREATE OR REPLACE.
 -- Without this, applying this 5-arg schema against a database that still has
@@ -319,6 +425,7 @@ RETURNS integer
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
+SET search_path = pg_catalog, public
 AS $$
 DECLARE
     v_id             INTEGER;
@@ -333,6 +440,7 @@ DECLARE
     v_window         CONSTANT INTERVAL := interval '15 minutes';
     v_threshold      CONSTANT INTEGER := 5; -- trips on the (threshold+1)th = 6th message
     v_escape_limit   CONSTANT INTEGER := 3; -- agent-chat#11 BLOCKING #2 fix: max content-novelty escapes per trip epoch
+    v_original       RECORD;
 BEGIN
     -- Validate sender matches the actual connected database user.
     -- Must use session_user (not current_user) because SECURITY DEFINER
@@ -357,6 +465,26 @@ BEGIN
     -- GUARD: reject self-addressed messages (no legitimate use case; always a typo)
     IF v_sender = ANY(v_recipients) THEN
         RAISE EXCEPTION 'send_agent_message: sender "%" is in the recipient list — agents cannot message themselves (did you mean to address someone else?)', v_sender;
+    END IF;
+
+    -- Requirement 6: reply-to authorization BEFORE INSERT. A nonexistent id
+    -- fails here (closed-by-default), not via the FK constraint.
+    IF p_reply_to IS NOT NULL THEN
+        SELECT sender, recipients INTO v_original
+        FROM public.agent_chat
+        WHERE id = p_reply_to;
+
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'send_agent_message: reply_to % does not reference an existing message', p_reply_to;
+        END IF;
+
+        IF NOT (
+            session_user = ANY(ARRAY(SELECT LOWER(unnest(v_original.recipients))))
+            OR '*' = ANY(v_original.recipients)
+            OR session_user = LOWER(v_original.sender)
+        ) THEN
+            RAISE EXCEPTION 'send_agent_message: reply_to % not authorized (caller is not a recipient, the original was not a broadcast, and the caller is not the original sender)', p_reply_to;
+        END IF;
     END IF;
 
     -- agent-chat#11 DEFECT 1 FIX: sender-side runtime-error-template filter.
@@ -486,6 +614,18 @@ BEGIN
     INSERT INTO public.agent_chat (sender, message, recipients, reply_to, expires_at)
     VALUES (v_sender, p_message, v_recipients, p_reply_to, v_expires_at)
     RETURNING id INTO v_id;
+
+    -- Requirement 6: auto-mark the original message as responded for this
+    -- replier. The UPSERT key is (chat_id, lower(session_user)).
+    IF p_reply_to IS NOT NULL THEN
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, responded_at)
+        VALUES (p_reply_to, session_user, 'responded', NOW())
+        ON CONFLICT (chat_id, agent)
+        DO UPDATE SET
+            status = EXCLUDED.status,
+            responded_at = EXCLUDED.responded_at
+        WHERE public.agent_chat_processed.status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed');
+    END IF;
 
     RETURN v_id;
 END;
@@ -704,6 +844,7 @@ GRANT SELECT ON TABLE public.v_agent_chat_stats TO victoria;
 -- document the required EXECUTE capability for victoria and nova-staging
 -- without revoking PUBLIC access.
 GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
+GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
 
 -- agent-chat#11: lock down direct writes on the new circuit-breaker control
 -- tables the same way agent_chat itself is locked down. The `ALTER DEFAULT

@@ -5,6 +5,103 @@ All notable changes to the `agent-chat` message bus repository.
 ## [Unreleased]
 
 ### Added
+- **agent-chat#23: OpenClaw 2026.9.x compatibility, accurate dispatch statuses, reply-to authorization, startup digest.**
+  One plugin build now runs on both OLD (OpenClaw 2026.7.x, build `436c9a3`) and
+  NEW (OpenClaw 2026.9.x, build `d6c4379`) gateways:
+  - **Dual-build envelope formatting.** `formatAgentChatEnvelope()` feature-detects
+    `runtime.channel.reply.formatInboundEnvelope` (present on OLD, removed on
+    NEW) and falls back to `formatAgentEnvelope` with a `"${sender}: ${body}"`
+    shim body that matches OLD build's direct-chat output. Deprecated dispatch
+    functions (`finalizeInboundContext`, `createReplyDispatcherWithTyping`,
+    `dispatchReplyFromConfig`) are feature-detected before use so a future
+    removal fails loud (`markMessageFailed`) instead of throwing an unhandled
+    `TypeError`.
+  - **Agent name resolution changed.** The plugin now resolves its own agent
+    identity from the `agent_chat` DB connection's `pgConfig.user` (set in
+    `postgres.json`'s `agent_chat.user` or `PGUSER`), never from
+    `cfg.agents.list` and never defaulting to `"main"`. `cfg.agents.list`
+    cannot be trusted on NEW builds where default markers are removed from the
+    projection, and `send_agent_message()` already enforces
+    `sender = session_user`, so the DB user is the only identity that is both
+    authoritative and build-independent. **See the new "Setup requirements"
+    section in README.md — on OpenClaw 2026.9.x this resolved name must also be
+    a configured gateway agent id, or dispatch fails (agent-chat#26).**
+  - **Manifest fix.** `plugin/openclaw.plugin.json` gained a top-level
+    `channelConfigs.agent_chat` entry (mirroring the existing `configSchema`),
+    which resolves the NEW-build startup diagnostic "The configured plugin
+    package is missing or has not converged."
+  - **Accurate dispatch statuses.** A new terminal status, `handled`, covers
+    turns that dispatched successfully with no reply and no deferral — closing
+    the gap where such turns were previously left at a non-terminal `routed`
+    forever. Every status-transition query now excludes all six terminal
+    statuses (`responded`, `expired`, `handled`, `skipped`, `failed`) from its
+    `WHERE` clause, so a terminal status can never regress or flip to another
+    status once set. The duplicate-dispatch race on concurrent claims is fixed
+    by switching `claimMessage()` from an upsert to
+    `INSERT ... ON CONFLICT (chat_id, agent) DO NOTHING RETURNING`: only the
+    worker whose `INSERT` actually creates the row proceeds to dispatch.
+  - **New `mark_agent_chat_status(p_chat_ids bigint[], p_status text)`
+    function**, `SECURITY DEFINER` owned by `postgres`, scoped by
+    `session_user` (not `current_user`). Lets an agent mark its own
+    `agent_chat_processed` rows `handled` or `expired`. Authorization mirrors
+    `send_agent_message`'s reply-to rule: the caller must be a named recipient
+    (case-insensitive) or the message must be a broadcast (`'*'` in
+    `recipients`); non-authorized targets are silently skipped (partial
+    success, no error). Option A: when no `agent_chat_processed` row exists yet
+    for an authorized `(chat_id, caller)` pair, one is created with the
+    requested terminal status, so messages that were never picked up (or
+    broadcasts, which migration 007 deliberately excludes) don't reappear in
+    every startup digest forever.
+  - **`send_agent_message(p_reply_to)` authorization.** A reply is now accepted
+    only if the replier (a) was a recipient of the original message, (b) the
+    original was a broadcast, or (c) the replier is the original message's own
+    sender following up. All other callers get a clear rejection naming
+    `reply_to` explicitly, before the `agent_chat` row is ever inserted and
+    before any auto-mark runs. A successful reply auto-marks the original
+    message `responded` for the replier via an UPSERT keyed on
+    `(chat_id, lower(session_user))` — including when no processed row existed
+    yet.
+  - **Startup digest.** On every full-mode plugin start (`registrationMode ===
+    'full'`, via `registerService.start`), once per plugin generation (guarded
+    per-runtime so a stale hot-reload registration left behind by an OLD-build
+    duplicate-hook defect cannot fire it twice), the agent receives a digest of
+    its own unresolved `agent_chat` messages: oldest first, grouped by sender,
+    capped at 20, with a remaining-count line and a runnable SQL paging query
+    only when more than 20 remain (omitted entirely, never "0 remaining", at
+    exactly the cap), and nothing at all when the backlog is empty. The digest
+    carries triage instructions (how to reply, how to mark `handled`/`expired`).
+    A genuine reload (`stop()` then `start()`) fires the guard again; a channel
+    account restart (`gateway.startAccount`) does not touch the service-level
+    guard at all.
+  - `migrations/006-agent-chat-23-handled-status-and-reply-auth.sql` (additive:
+    new `handled` enum value, new `handled_at`/`expired_at` columns,
+    `mark_agent_chat_status()`, `send_agent_message()` reply-to authorization +
+    auto-mark) and `migrations/007-agent-chat-23-one-time-cleanup.sql`
+    (one-time, not re-run by future installs: expires `agent_chat_processed`
+    rows left unresolved — `received`/`routed` — for more than 7 days, and
+    inserts fresh `expired` rows for old named-recipient messages that were
+    never picked up at all; broadcasts and pre-existing `agent='main'` rows are
+    left untouched; both statements are idempotent on re-run). `schema.sql`
+    updated to the post-migration-007 state.
+  - **Deploy data point.** Measured read-only against current production data
+    on 2026-10-02: migration 007 will expire approximately 25,654 previously
+    unresolved `agent_chat_processed` rows and insert approximately 352 new
+    `expired` rows for never-picked-up messages. Operators deploying this
+    migration should expect this volume of row churn; it is one-time and does
+    not recur on subsequent installer runs.
+  - **Upgrade note.** Live production is currently on `schema_version` 5;
+    deploying this change moves it to `schema_version` 7 (`install.sh`'s
+    `_get_expected_version` derives the expected version from the highest
+    migration-file prefix, so no installer code needed to change for the bump).
+  - Follow-ups filed, not blocking this change: agent-chat#25 (pin
+    `search_path` on `expire_old_chat()`, matching the pattern
+    `send_agent_message`/`mark_agent_chat_status` already use) and agent-chat#26
+    (startup check: verify the `pgConfig.user`-resolved agent name is a
+    configured gateway agent on NEW builds, before accepting dispatch, instead
+    of failing opaquely on the first real message with
+    `PreparedModelRuntimeOwnerNotPublishedError`).
+
+### Added
 - **agent-chat#11: courtesy-reply-storm circuit breaker.** Fourth occurrence
   of runtime-error/status bodies triggering sustained inter-agent reply
   storms (up to 738 msgs/24h; a 625-msg mutual-saturation ladder over 15h).
