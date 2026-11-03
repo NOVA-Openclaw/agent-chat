@@ -33,10 +33,6 @@
           "pollIntervalMs": {
             "type": "integer",
             "description": "Keep-alive poll interval in ms"
-          },
-          "routeToSession": {
-            "type": "string",
-            "description": "Route messages to a specific session instead of creating unique sessions per message"
           }
         }
       }
@@ -69,11 +65,14 @@
       "pollIntervalMs": {
         "type": "integer",
         "description": "Keep-alive poll interval in ms"
-      },
-      "routeToSession": {
-        "type": "string",
-        "description": "Route messages to a specific session instead of creating unique sessions per message"
       }
     }
+  },
+  "contracts": {
+    "tools": [
+      "agent_chat_send",
+      "agent_chat_mark",
+      "agent_chat_mute"
+    ]
   }
 }
