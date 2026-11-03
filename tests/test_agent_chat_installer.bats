@@ -117,8 +117,12 @@ teardown() {
     # while a role still has privileges granted on live objects, so the
     # database must go before the roles that were granted access to it.
     if [ -n "${AGENT_CHAT_DB_NAME:-}" ]; then
-        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
+        psql -d postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$AGENT_CHAT_DB_NAME' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+        dropdb --if-exists --force "$AGENT_CHAT_DB_NAME" >/dev/null 2>&1 || true
     fi
+
+    # Ensure no install.sh background listener is left running for this DB.
+    pkill -f "install\.sh.*$AGENT_CHAT_DB_NAME" 2>/dev/null || true
 
     # TC-11x helper roles: drop unconditionally in the global teardown (not
     # inline at the end of each test body) so a failed assertion mid-test
@@ -128,6 +132,9 @@ teardown() {
     fi
     if [ -n "${_TC11X_ROLE_B:-}" ]; then
         psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_B\";" >/dev/null 2>&1 || true
+    fi
+    if [ -n "${_TC11X_ROLE_C:-}" ]; then
+        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$_TC11X_ROLE_C\";" >/dev/null 2>&1 || true
     fi
     if [ -n "${_TC11X_PGPASSFILE:-}" ]; then
         rm -f "$_TC11X_PGPASSFILE"
@@ -332,29 +339,69 @@ _tc11x_setup_roles_and_schema() {
     _TC11X_ROLE_A="flint"
     _TC11X_ROLE_B="quill"
     _TC11X_ROLE_C="scout"
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO "$_TC11X_ROLE_A", "$_TC11X_ROLE_B", "$_TC11X_ROLE_C";" >/dev/null 2>&1 || true
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO "$_TC11X_ROLE_A", "$_TC11X_ROLE_B", "$_TC11X_ROLE_C";" >/dev/null 2>&1 || true
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;" >/dev/null 2>&1 || true
+    _TC11X_USE_SESSION_AUTH=""
 
     _TC11X_PGPASSFILE="$(mktemp)"
     chmod 600 "$_TC11X_PGPASSFILE"
     sed 's/:agent_chat:/:*:/g; s/:nova_memory:/:*:/g' /home/nova/.pgpass > "$_TC11X_PGPASSFILE"
+
+    # Detect whether the connecting role can create/alter roles. In some test
+    # environments the fixture roles already exist and cannot be recreated.
+    local can_createrole
+    can_createrole=$(psql -d postgres -v ON_ERROR_STOP=0 -At -c "SELECT rolcreaterole FROM pg_roles WHERE rolname = current_user;" 2>/dev/null || echo "f")
+    [ "$can_createrole" = "t" ] || _TC11X_USE_SESSION_AUTH=1
+
+    # Create ephemeral LOGIN fixture roles with generated passwords and a
+    # matching per-role pgpass entry. Re-create them so a stale NOLOGIN role
+    # from an earlier suite cannot block LOGIN creation.
+    local role pass
+    for role in "$_TC11X_ROLE_A" "$_TC11X_ROLE_B" "$_TC11X_ROLE_C"; do
+        pass="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+        if [ "$can_createrole" = "t" ]; then
+            psql -d postgres -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
+            psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$role\" LOGIN PASSWORD '$pass';" >/dev/null
+        else
+            # Ensure the role exists (cluster-wide fixture); skip creation if
+            # the test runner lacks CREATEROLE.
+            psql -d postgres -v ON_ERROR_STOP=0 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$role') THEN CREATE ROLE \"$role\" LOGIN PASSWORD '$pass'; END IF; END \$\$;" >/dev/null 2>&1 || true
+        fi
+        psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO \"$role\"; GRANT INSERT, SELECT ON public.agent_chat TO \"$role\"; GRANT INSERT, SELECT, UPDATE ON public.agent_chat_processed TO \"$role\"; GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO \"$role\"; GRANT EXECUTE ON FUNCTION public.send_agent_message(text,text,text[],interval,integer) TO \"$role\";" >/dev/null
+        printf 'localhost:5432:%s:%s:%s\n' "$AGENT_CHAT_DB_NAME" "$role" "$pass" >> "$_TC11X_PGPASSFILE"
+    done
+
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;" >/dev/null 2>&1 || true
 }
 
 # Role/pgpass cleanup happens unconditionally in the global teardown() above
 # (not here) so a failed assertion mid-test still cleans up.
 
+# Run an arbitrary SQL statement as the given fixture role.
+_tc11x_psql_as() {
+    local role="$1"
+    local sql="$2"
+    local raw rc
+    if [ "${_TC11X_USE_SESSION_AUTH:-}" = "1" ]; then
+        raw=$(PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U nova -d "$AGENT_CHAT_DB_NAME" -At \
+            -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION \"$role\"; $sql" 2>&1)
+    else
+        raw=$(PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$role" -d "$AGENT_CHAT_DB_NAME" -At \
+            -v ON_ERROR_STOP=1 -c "$sql" 2>&1)
+    fi
+    rc=$?
+    # Drop the SET command tag so tests see only query output.
+    printf '%s' "$raw" | sed '1{/^SET$/d}'
+    return $rc
+}
+
 # Send as role A (session_user == p_sender == role A) to the given recipient.
 _tc11x_send_as_a() {
     local recipient="$1" message="$2"
-    PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -At \
-        -c "SELECT send_agent_message('${_TC11X_ROLE_A}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
+    _tc11x_psql_as "$_TC11X_ROLE_A" "SELECT send_agent_message('${_TC11X_ROLE_A}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
 }
 
 _tc11x_send_as_b() {
     local recipient="$1" message="$2"
-    PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_B" -d "$AGENT_CHAT_DB_NAME" -At \
-        -c "SELECT send_agent_message('${_TC11X_ROLE_B}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
+    _tc11x_psql_as "$_TC11X_ROLE_B" "SELECT send_agent_message('${_TC11X_ROLE_B}', '$(printf '%s' "$message" | sed "s/'/''/g")', ARRAY['${recipient}']);"
 }
 
 @test "TC-110: sender-side filter quarantines the occurrence 2/3 runtime-error template" {
@@ -847,20 +894,20 @@ _tc11x_send_as_b() {
 @test "TC-117: standard agent roles cannot write directly to the new control tables" {
     _tc11x_setup_roles_and_schema
 
-    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_error_templates (pattern) VALUES ('direct write attempt');"
+    run _tc11x_psql_as "$_TC11X_ROLE_A" "INSERT INTO agent_chat_error_templates (pattern) VALUES ('direct write attempt');"
     [ "$status" -ne 0 ]
     [[ "$output" == *"permission denied"* ]]
 
-    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_breaker_state (sender, recipient) VALUES ('x','y');"
+    run _tc11x_psql_as "$_TC11X_ROLE_A" "INSERT INTO agent_chat_breaker_state (sender, recipient) VALUES ('x','y');"
     [ "$status" -ne 0 ]
     [[ "$output" == *"permission denied"* ]]
 
-    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -c "INSERT INTO agent_chat_suppressed_log (reason, sender, recipients, message_sample) VALUES ('loop_breaker','x',ARRAY['y'],'z');"
+    run _tc11x_psql_as "$_TC11X_ROLE_A" "INSERT INTO agent_chat_suppressed_log (reason, sender, recipients, message_sample) VALUES ('loop_breaker','x',ARRAY['y'],'z');"
     [ "$status" -ne 0 ]
     [[ "$output" == *"permission denied"* ]]
 
     # SELECT must still work (loud-in-the-log constraint requires readability).
-    run env PGPASSFILE="$_TC11X_PGPASSFILE" psql -h localhost -U "$_TC11X_ROLE_A" -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM agent_chat_error_templates;"
+    run _tc11x_psql_as "$_TC11X_ROLE_A" "SELECT count(*) FROM agent_chat_error_templates;"
     [ "$status" -eq 0 ]
     [ "$output" -ge 3 ]
 

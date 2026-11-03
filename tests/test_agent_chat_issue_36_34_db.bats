@@ -55,15 +55,22 @@ _se36_send_as_nova() {
     _se36_sql "$db_name" "SELECT send_agent_message('nova', '${escaped}', ARRAY['${recipient}'], NULL, ${reply_to});"
 }
 
+# Terminate backends and force-drop a per-test scratch database.
+_se36_teardown_db() {
+    local db_name="$1"
+    [ -n "$db_name" ] || return 0
+    psql -d postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    dropdb --if-exists --force "$db_name" >/dev/null 2>&1 || true
+    pkill -f "install\.sh.*$db_name" 2>/dev/null || true
+}
+
 setup() {
     AGENT_CHAT_DB_NAME="$(_se36_db_name)"
     _se36_setup_db "$AGENT_CHAT_DB_NAME"
 }
 
 teardown() {
-    if [ -n "${AGENT_CHAT_DB_NAME:-}" ]; then
-        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
-    fi
+    _se36_teardown_db "${AGENT_CHAT_DB_NAME:-}"
 }
 
 # ─── D cases: mark_agent_chat_status ───────────────────────────────────────

@@ -38,6 +38,7 @@ _issue23_setup_roles() {
     shift
     local role
     for role in "$@"; do
+        psql -d postgres -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$role') THEN CREATE ROLE \"$role\" NOLOGIN; END IF; END \$\$;" >/dev/null
         psql -d "$db_name" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO \"$role\"; GRANT INSERT, SELECT ON public.agent_chat TO \"$role\"; GRANT INSERT, SELECT, UPDATE ON public.agent_chat_processed TO \"$role\"; GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO \"$role\";" >/dev/null
     done
 }
@@ -47,6 +48,15 @@ _issue23_psql_as() {
     local role="$2"
     local sql="$3"
     psql -d "$db_name" -At -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION \"$role\"; $sql"
+}
+
+# Terminate backends and force-drop a per-test scratch database.
+_issue23_teardown_db() {
+    local db_name="$1"
+    [ -n "$db_name" ] || return 0
+    psql -d postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    dropdb --if-exists --force "$db_name" >/dev/null 2>&1 || true
+    pkill -f "install\.sh.*$db_name" 2>/dev/null || true
 }
 
 _issue23_run_cleanup() {
@@ -66,12 +76,10 @@ setup() {
 }
 
 teardown() {
-    if [ -n "${AGENT_CHAT_DB_NAME:-}" ]; then
-        psql -d postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
-    fi
+    _issue23_teardown_db "${AGENT_CHAT_DB_NAME:-}"
     if [ ${#_ISSUE23_ROLES[@]} -gt 0 ]; then
         for role in "${_ISSUE23_ROLES[@]}"; do
-            psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true >/dev/null 2>&1 || true
+            psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
         done
     fi
     rm -rf "$FAKE_HOME"
@@ -80,7 +88,7 @@ teardown() {
 teardown_file() {
     if [ -s "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt" ]; then
         while IFS= read -r role; do
-            [ -n "$role" ] && psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true >/dev/null 2>&1 || true
+            [ -n "$role" ] && psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
         done < "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt"
     fi
 }
