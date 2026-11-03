@@ -1,11 +1,14 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createRequire } from "node:module";
 import pg from "pg";
-import { agentChatPlugin, resolveAgentName } from "./src/channel.js";
+import { agentChatPlugin, createPgClient, resolveAgentName } from "./src/channel.js";
 import { setAgentChatRuntime } from "./src/runtime.js";
 import { AgentChatConfigSchema } from "./src/config.js";
 import { createStartupDigestService } from "./src/digest.js";
+import { createAgentChatTools } from "./src/tools.js";
 import { loadPgEnv } from "./lib/pg-env.js";
+
+const pgConfig = loadPgEnv(undefined, "agent_chat");
 
 const plugin = {
   id: "agent_chat",
@@ -32,13 +35,21 @@ const plugin = {
     setAgentChatRuntime(api.runtime);
     api.registerChannel({ plugin: agentChatPlugin });
 
+    // --- Agent-callable tools: explicit send, mark, and mute ---
+    // Registered as a factory so subagents can be excluded via toolContext.sandboxed.
+    // No DB connection is opened at register time; each execute() creates its own.
+    const toolsFactory = createAgentChatTools({
+      createClient: createPgClient,
+      resolveAgentName,
+    });
+    api.registerTool(toolsFactory, { names: ["agent_chat_send", "agent_chat_mark", "agent_chat_mute"] });
+
     // --- Startup digest service: only registered in full registration mode ---
     // register() runs in discovery/setup/cli-metadata modes where DB side effects
     // are unsafe. The digest is registered as a service so it fires from
     // registerService.start on gateway load and plugin reload.
     const registrationMode = (api as unknown as Record<string, unknown>).registrationMode;
     if (registrationMode === "full") {
-      const pgConfig = loadPgEnv(undefined, "agent_chat");
       const digestService = createStartupDigestService({
         runtime: api.runtime,
         resolveAgentName,

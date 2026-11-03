@@ -127,12 +127,14 @@ function makeFakeApi(options: {
   api: OpenClawPluginApi;
   services: unknown[];
   channels: unknown[];
+  tools: unknown[];
   logs: ReturnType<typeof makeLogger>["lines"];
 } {
   const runtime = options.runtime ?? makeBaseRuntime();
   const logger = makeLogger();
   const services: unknown[] = [];
   const channels: unknown[] = [];
+  const tools: unknown[] = [];
 
   const api = {
     id: "agent_chat",
@@ -144,9 +146,10 @@ function makeFakeApi(options: {
     registrationMode: options.registrationMode ?? "full",
     registerChannel: (reg: unknown) => channels.push(reg),
     registerService: (svc: unknown) => services.push(svc),
+    registerTool: (tool: unknown, opts?: unknown) => tools.push({ tool, opts }),
   } as unknown as OpenClawPluginApi;
 
-  return { api, services, channels, logs: logger.lines };
+  return { api, services, channels, tools, logs: logger.lines };
 }
 
 function makeServiceCtx(): {
@@ -479,7 +482,7 @@ describe("TC-23-062: grouped by sender with previews", () => {
 });
 
 describe("TC-23-063: instructions present", () => {
-  it("includes reply, mark-handled, mark-expired, and status-maintenance instructions", async () => {
+  it("includes agent_chat_send, agent_chat_mark, and agent_chat_mute instructions", async () => {
     let body = "";
     const runtime = makeBaseRuntime();
     (runtime.channel!.reply as Record<string, unknown>).dispatchReplyFromConfig = async (args: {
@@ -497,10 +500,13 @@ describe("TC-23-063: instructions present", () => {
 
     await service.start(makeServiceCtx() as never);
 
-    assert.match(body, /send_agent_message.*p_reply_to/i);
-    assert.match(body, /mark_agent_chat_status.*handled/i);
-    assert.match(body, /mark_agent_chat_status.*expired/i);
+    assert.match(body, /agent_chat_send.*replyTo/i);
+    assert.match(body, /agent_chat_mark.*handled/i);
+    assert.match(body, /agent_chat_mark.*skipped/i);
+    assert.match(body, /agent_chat_mute/i);
     assert.match(body, /keep statuses current/i);
+    assert.doesNotMatch(body, /send_agent_message.*p_reply_to/i);
+    assert.doesNotMatch(body, /SELECT mark_agent_chat_status/i);
   });
 });
 
