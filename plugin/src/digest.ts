@@ -242,14 +242,12 @@ export async function deliverDigest(options: {
 
   const replyApi = runtime.channel!.reply;
   const sessionLabel = `agent:${agentName}:agent_chat`;
-  const agentChatTo = `agent_chat:${agentName}`;
 
   const ctxPayload = replyApi.finalizeInboundContext({
     Body: digestText,
     RawBody: digestText,
     CommandBody: digestText,
     From: "agent_chat",
-    To: agentChatTo,
     SessionKey: sessionLabel,
     ChatType: "direct",
     ConversationLabel: "agent_chat",

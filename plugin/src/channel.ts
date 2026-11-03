@@ -459,14 +459,12 @@ export async function injectBreakerAlert(options: {
   }
 
   const sessionLabel = buildSessionLabel({ agentName, peer });
-  const agentChatTo = `agent_chat:${agentName}`;
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
     Body: alertText,
     RawBody: alertText,
     CommandBody: alertText,
     From: "agent_chat",
-    To: agentChatTo,
     SessionKey: sessionLabel,
     ChatType: "direct",
     ConversationLabel: peer,
@@ -618,14 +616,12 @@ export async function processAgentChatMessage({
     }
 
     const sessionLabel = buildSessionLabel({ agentName, peer: message.sender });
-    const agentChatTo = `agent_chat:${agentName}`;
 
     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
       Body: body,
       RawBody: message.message,
       CommandBody: message.message,
       From: `agent_chat:${message.sender}`,
-      To: agentChatTo,
       SessionKey: sessionLabel,
       ChatType: isBroadcast ? "group" : "direct",
       ConversationLabel: `${message.sender}`,

@@ -20,6 +20,7 @@ import {
   processAgentChatMessage,
   sanitizeSessionPeer,
 } from "../src/channel.js";
+import { deliverDigest } from "../src/digest.js";
 import { setAgentChatRuntime } from "../src/runtime.js";
 import { createAgentChatTools } from "../src/tools.js";
 
@@ -481,8 +482,8 @@ describe("A05: fallback summary is suppressed", () => {
   });
 });
 
-describe("A12: origin route is closed (no OriginatingTo)", () => {
-  it("finalizeInboundContext receives OriginatingChannel but no OriginatingTo", async () => {
+describe("A12: origin route is closed (no deliverable agent_chat target)", () => {
+  it("inbound message context has no To/OriginatingTo", async () => {
     const runtime = makeBaseRuntime();
     let capturedCtx: Record<string, unknown> | undefined;
     (runtime.channel!.reply as Record<string, unknown>).finalizeInboundContext = (
@@ -507,7 +508,81 @@ describe("A12: origin route is closed (no OriginatingTo)", () => {
     assert.strictEqual(capturedCtx?.OriginatingChannel, "agent_chat");
     assert.ok(
       capturedCtx?.OriginatingTo === undefined || capturedCtx?.OriginatingTo === null,
-      "OriginatingTo must be absent so announces cannot route back to agent_chat",
+      "OriginatingTo must be absent",
+    );
+    assert.ok(
+      capturedCtx?.To === undefined || capturedCtx?.To === null,
+      "To must be absent so the stored delivery context has no deliverable agent_chat target",
+    );
+  });
+
+  it("breaker alert context has no To/OriginatingTo", async () => {
+    const runtime = makeBaseRuntime();
+    let capturedCtx: Record<string, unknown> | undefined;
+    (runtime.channel!.reply as Record<string, unknown>).finalizeInboundContext = (
+      ctx: Record<string, unknown>,
+    ) => {
+      capturedCtx = ctx;
+      return ctx;
+    };
+    setAgentChatRuntime(runtime);
+
+    const fakeClient = makeFakeClient();
+    const fakeCtx = makeFakeCtx();
+
+    const alert = {
+      alert_id: 7,
+      pair_a: "newhart",
+      pair_b: "nova",
+      window_start: new Date("2026-10-02T19:00:00Z"),
+      window_end: new Date("2026-10-02T19:05:00Z"),
+      message_count: 6,
+      threshold: 6,
+      created_at: new Date("2026-10-02T19:05:00Z"),
+    };
+
+    await injectBreakerAlert({
+      alert,
+      client: fakeClient as unknown as import("pg").Client,
+      agentName: "newhart",
+      cfg: fakeCtx.cfg,
+      ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
+      runtime,
+    });
+
+    assert.strictEqual(capturedCtx?.OriginatingChannel, "agent_chat");
+    assert.ok(
+      capturedCtx?.OriginatingTo === undefined || capturedCtx?.OriginatingTo === null,
+    );
+    assert.ok(
+      capturedCtx?.To === undefined || capturedCtx?.To === null,
+    );
+  });
+
+  it("startup digest context has no To/OriginatingTo", async () => {
+    const runtime = makeBaseRuntime();
+    let capturedCtx: Record<string, unknown> | undefined;
+    (runtime.channel!.reply as Record<string, unknown>).finalizeInboundContext = (
+      ctx: Record<string, unknown>,
+    ) => {
+      capturedCtx = ctx;
+      return ctx;
+    };
+    setAgentChatRuntime(runtime);
+
+    await deliverDigest({
+      runtime,
+      cfg: runtime.cfg ?? ({} as OpenClawConfig),
+      agentName: "newhart",
+      digestText: "test digest",
+    });
+
+    assert.strictEqual(capturedCtx?.OriginatingChannel, "agent_chat");
+    assert.ok(
+      capturedCtx?.OriginatingTo === undefined || capturedCtx?.OriginatingTo === null,
+    );
+    assert.ok(
+      capturedCtx?.To === undefined || capturedCtx?.To === null,
     );
   });
 });
