@@ -31,9 +31,9 @@ _issue23_setup_db() {
     local db_name="$1"
     act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1
     act_admin_psql postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
-    act_admin_psql "$db_name" -f "$REPO_ROOT/schema.sql" >/dev/null 2>&1
+    act_apply_sql_file "$db_name" "$REPO_ROOT/schema.sql" >/dev/null 2>&1
     for f in "$REPO_ROOT"/migrations/*.sql; do
-        act_admin_psql "$db_name" -f "$f" >/dev/null 2>&1 || {
+        act_apply_sql_file "$db_name" "$f" >/dev/null 2>&1 || {
             echo "FAILED to apply $(basename "$f")" >&2
             return 1
         }
@@ -118,6 +118,12 @@ setup() {
     declare -gA _ISSUE23_ROLE_CREATED
     AGENT_CHAT_DB_NAME="agent_chat_test_issue23_${BATS_TEST_NUMBER}_$$"
     _ISSUE23_ROLES=()
+
+    # Enable the devtest gate for installer schema/migration applies in this
+    # suite (e.g. TC-23-086).  The non-superuser test admin cannot execute
+    # ALTER DEFAULT PRIVILEGES / ALTER FUNCTION OWNER without it.
+    export PGOPTIONS='-c agent_chat.devtest=on'
+
     _issue23_setup_db "$AGENT_CHAT_DB_NAME"
     # Create a fixture for the historical "nova" identity used by many tests.
     nova="$(_issue23_agent_name nova)"

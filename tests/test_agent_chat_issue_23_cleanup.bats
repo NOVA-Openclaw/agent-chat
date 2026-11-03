@@ -22,9 +22,9 @@ _issue23_setup_db() {
     local db_name="$1"
     act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1
     act_admin_psql postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
-    act_admin_psql "$db_name" -f "$REPO_ROOT/schema.sql" >/dev/null 2>&1
+    act_apply_sql_file "$db_name" "$REPO_ROOT/schema.sql" >/dev/null 2>&1
     for f in "$REPO_ROOT"/migrations/*.sql; do
-        act_admin_psql "$db_name" -f "$f" >/dev/null 2>&1 || {
+        act_apply_sql_file "$db_name" "$f" >/dev/null 2>&1 || {
             echo "FAILED to apply $(basename "$f")" >&2
             return 1
         }
@@ -67,7 +67,7 @@ _issue23_teardown_db() {
 
 _issue23_run_cleanup() {
     local db_name="$1"
-    act_admin_psql "$db_name" -f "$REPO_ROOT/migrations/007-agent-chat-23-one-time-cleanup.sql" >/dev/null 2>&1
+    act_apply_sql_file "$db_name" "$REPO_ROOT/migrations/007-agent-chat-23-one-time-cleanup.sql" >/dev/null 2>&1
 }
 
 setup() {

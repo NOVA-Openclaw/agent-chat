@@ -340,7 +340,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.send_agent_message(text, text, text[], interval, integer) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
@@ -411,7 +415,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.mark_agent_chat_status(bigint[], text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping mark_agent_chat_status owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping mark_agent_chat_status owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
@@ -444,7 +452,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.agent_chat_pending_alerts(text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping agent_chat_pending_alerts owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_pending_alerts owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.agent_chat_pending_alerts(text) TO victoria, "nova-staging";
@@ -470,7 +482,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.agent_chat_mark_alerts_seen(integer[]) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping agent_chat_mark_alerts_seen owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_mark_alerts_seen owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.agent_chat_mark_alerts_seen(integer[]) TO victoria, "nova-staging";
@@ -535,7 +551,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.agent_chat_mute_peer(text, integer, text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping agent_chat_mute_peer owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_mute_peer owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.agent_chat_mute_peer(text, integer, text) TO victoria, "nova-staging";
@@ -571,7 +591,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.agent_chat_unmute_peer(text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping agent_chat_unmute_peer owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_unmute_peer owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.agent_chat_unmute_peer(text) TO victoria, "nova-staging";
@@ -596,7 +620,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.agent_chat_is_muted(text, text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping agent_chat_is_muted owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_is_muted owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 GRANT EXECUTE ON FUNCTION public.agent_chat_is_muted(text, text) TO victoria, "nova-staging";
@@ -664,7 +692,11 @@ DO $$
 BEGIN
     ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 COMMIT;

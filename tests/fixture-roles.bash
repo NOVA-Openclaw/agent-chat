@@ -47,6 +47,16 @@ act_admin_psql() {
     PGPASSFILE="$ACT_PGPASSFILE" psql -h "$ACT_ADMIN_HOST" -p "$ACT_ADMIN_PORT" -U "$ACT_ADMIN_USER" -d "$db" -v ON_ERROR_STOP=1 "$@"
 }
 
+# Apply a schema/migration SQL file as the admin user with the devtest gate
+# enabled, so insufficient_privilege handlers in schema.sql and migrations log
+# a notice instead of raising.  Production applies (e.g. install.sh) must NOT
+# set this flag so privilege errors fail loudly.
+act_apply_sql_file() {
+    local db="$1"
+    local sql_file="$2"
+    PGOPTIONS='-c agent_chat.devtest=on' act_admin_psql "$db" -f "$sql_file"
+}
+
 # Run psql as a fixture role.
 act_fixture_psql() {
     local role="$1"

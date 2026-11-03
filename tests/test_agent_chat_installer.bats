@@ -93,6 +93,13 @@ setup() {
     # Create the per-test database so scripts that expect an existing bus can connect.
     act_admin_psql postgres -c "CREATE DATABASE \"$AGENT_CHAT_DB_NAME\";" >/dev/null 2>&1 || true
 
+    # Enable the devtest gate for installer schema/migration applies.  In tests
+    # the installer runs as the non-superuser agentchat_test role, so the
+    # privilege-catch wrappers in schema.sql/migrations must notice-and-skip
+    # instead of raising.  Production runs as postgres/superuser and never hit
+    # the handlers.
+    export PGOPTIONS='-c agent_chat.devtest=on'
+
     # Install a fake crontab shim so cron installation tests never touch the
     # real user crontab of the test host.
     CRONTAB_SHIM_DIR="$(mktemp -d)"

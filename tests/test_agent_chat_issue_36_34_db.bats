@@ -30,9 +30,9 @@ _se36_setup_db() {
     local db_name="$1"
     act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1
     act_admin_psql postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
-    act_admin_psql "$db_name" -f "$REPO_ROOT/schema.sql" >/dev/null 2>&1
+    act_apply_sql_file "$db_name" "$REPO_ROOT/schema.sql" >/dev/null 2>&1
     for f in "$REPO_ROOT"/migrations/*.sql; do
-        act_admin_psql "$db_name" -f "$f" >/dev/null 2>&1 || {
+        act_apply_sql_file "$db_name" "$f" >/dev/null 2>&1 || {
             echo "FAILED to apply $(basename "$f")" >&2
             return 1
         }
@@ -720,4 +720,76 @@ teardown() {
 
     run _se36_sql "$AGENT_CHAT_DB_NAME" "SELECT agent FROM public.agent_chat_mutes WHERE peer = 'peer_b';"
     [ "$output" = "${SE36_FIXTURE_ROLE}" ]
+}
+
+@test "Z02: schema.sql applied by agentchat_test fails without devtest and succeeds with devtest" {
+    local scratch_db
+    scratch_db="agent_chat_test_se36_z02_${BATS_TEST_NUMBER}_$$"
+
+    act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$scratch_db\";" >/dev/null 2>&1
+    act_admin_psql postgres -c "CREATE DATABASE \"$scratch_db\";" >/dev/null
+    # The installer role must have CREATE on the public schema to reach the
+    # SECURITY DEFINER owner-assignment wrappers (the critical gating path).
+    act_admin_psql "$scratch_db" -c "GRANT CREATE ON SCHEMA public TO \"$ACT_ADMIN_USER\";" >/dev/null
+
+    # Without the devtest gate, the ALTER FUNCTION ... OWNER TO postgres
+    # wrappers must re-raise a privilege error for a non-superuser.
+    run act_admin_psql "$scratch_db" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/schema.sql"
+    local no_devtest_status=$status
+    local no_devtest_output=$output
+
+    # Cleanup before asserting so teardown is safe even on a partial apply.
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$scratch_db' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$scratch_db\";" >/dev/null 2>&1 || true
+
+    [ "$no_devtest_status" -ne 0 ]
+    [[ "$no_devtest_output" == *"insufficient_privilege"* ]] || \
+    [[ "$no_devtest_output" == *"must be owner"* ]] || \
+    [[ "$no_devtest_output" == *"must be able to SET ROLE"* ]] || \
+    [[ "$no_devtest_output" == *"permission denied"* ]]
+
+    # Re-create and apply with the devtest gate; this must succeed.
+    act_admin_psql postgres -c "CREATE DATABASE \"$scratch_db\";" >/dev/null
+    act_admin_psql "$scratch_db" -c "GRANT CREATE ON SCHEMA public TO \"$ACT_ADMIN_USER\";" >/dev/null
+    run act_apply_sql_file "$scratch_db" "$REPO_ROOT/schema.sql"
+    [ "$status" -eq 0 ]
+
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$scratch_db' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$scratch_db\";" >/dev/null 2>&1 || true
+}
+
+@test "Z01: schema.sql fails loudly when applied by a non-privileged role without devtest" {
+    # The privilege-catch wrappers in schema.sql and migration 008 must NOT
+    # swallow insufficient_privilege in production-like applies.  A bare,
+    # non-superuser apply without agent_chat.devtest=on must raise
+    # insufficient_privilege and roll back.
+    local scratch_db scratch_role scratch_pass scratch_pgpass
+    scratch_db="agent_chat_test_se36_z01_${BATS_TEST_NUMBER}_$$"
+    scratch_role="act_$(act_random_suffix)_unprivileged"
+    scratch_pass="$(act_random_password)"
+
+    act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$scratch_db\";" >/dev/null 2>&1
+    act_admin_psql postgres -c "CREATE DATABASE \"$scratch_db\";" >/dev/null
+    act_admin_psql postgres -c "DROP ROLE IF EXISTS \"$scratch_role\";" >/dev/null 2>&1 || true
+    act_admin_psql postgres -c "CREATE ROLE \"$scratch_role\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '$scratch_pass';" >/dev/null
+    act_admin_psql "$scratch_db" -c "GRANT CREATE ON SCHEMA public TO \"$scratch_role\";" >/dev/null
+
+    scratch_pgpass="$(mktemp)"
+    chmod 600 "$scratch_pgpass"
+    printf 'localhost:%s:*:%s:%s\n' "$ACT_ADMIN_PORT" "$scratch_role" "$scratch_pass" > "$scratch_pgpass"
+
+    # Apply schema.sql as the unprivileged role WITHOUT the devtest flag.
+    # ON_ERROR_STOP=1 ensures psql exits non-zero on the raised exception.
+    run env PGPASSFILE="$scratch_pgpass" psql -h "$ACT_ADMIN_HOST" -p "$ACT_ADMIN_PORT" -U "$scratch_role" -d "$scratch_db" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/schema.sql"
+
+    # Capture status before cleanup so assertions can still run on failure.
+    local apply_status="$status"
+
+    rm -f "$scratch_pgpass"
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$scratch_role\";" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$scratch_db' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$scratch_db\";" >/dev/null 2>&1 || true
+
+    [ "$apply_status" -ne 0 ]
+    [[ "$output" == *"insufficient_privilege"* ]] || [[ "$output" == *"ERROR:"* ]]
 }
