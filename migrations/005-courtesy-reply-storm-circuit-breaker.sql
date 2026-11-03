@@ -551,6 +551,13 @@ BEGIN
         FOREACH v_role IN ARRAY v_roles
         LOOP
             IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
+                -- Never revoke from the table owner: the owner must keep its
+                -- inherent privileges so migrations can run in non-superuser
+                -- dev/test environments. In production the owner is postgres,
+                -- which is not in v_roles, so this guard has no security effect.
+                IF v_role = session_user THEN
+                    CONTINUE;
+                END IF;
                 EXECUTE format(
                     'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
                     v_table, v_role

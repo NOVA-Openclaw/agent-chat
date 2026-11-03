@@ -13,7 +13,7 @@ REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
 # Agent names used as fixtures (suffix with test number + pid to avoid leaks).
 _issue23_agent_name() {
-    printf '%s_%s_%s' "$1" "$BATS_TEST_NUMBER" "$$"
+    printf '%s' "$1"
 }
 
 _issue23_track_role() {
@@ -38,9 +38,7 @@ _issue23_setup_roles() {
     shift
     local role
     for role in "$@"; do
-        psql -d postgres -v ON_ERROR_STOP=1 -c "DROP ROLE IF EXISTS \"$role\"; CREATE ROLE \"$role\" NOLOGIN;" >/dev/null
-        psql -d "$db_name" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO \"$role\"; GRANT INSERT, SELECT ON public.agent_chat TO \"$role\"; GRANT INSERT, SELECT, UPDATE ON public.agent_chat_processed TO \"$role\"; GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_state, public.agent_chat_suppressed_log TO \"$role\";" >/dev/null
-        _issue23_track_role "$role"
+        psql -d "$db_name" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO \"$role\"; GRANT INSERT, SELECT ON public.agent_chat TO \"$role\"; GRANT INSERT, SELECT, UPDATE ON public.agent_chat_processed TO \"$role\"; GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO \"$role\";" >/dev/null
     done
 }
 
@@ -73,7 +71,7 @@ teardown() {
     fi
     if [ ${#_ISSUE23_ROLES[@]} -gt 0 ]; then
         for role in "${_ISSUE23_ROLES[@]}"; do
-            psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
+            psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true >/dev/null 2>&1 || true
         done
     fi
     rm -rf "$FAKE_HOME"
@@ -82,7 +80,7 @@ teardown() {
 teardown_file() {
     if [ -s "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt" ]; then
         while IFS= read -r role; do
-            [ -n "$role" ] && psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
+            [ -n "$role" ] && psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true >/dev/null 2>&1 || true
         done < "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt"
     fi
 }

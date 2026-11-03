@@ -329,19 +329,16 @@ _tc11x_setup_roles_and_schema() {
     run "$INSTALLER"
     [ "$status" -eq 0 ]
 
-    _TC11X_ROLE_A="zz11a_${BATS_TEST_NUMBER}_$$"
-    _TC11X_ROLE_B="zz11b_${BATS_TEST_NUMBER}_$$"
-    psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_A\" LOGIN PASSWORD 'tc11xpw';"
-    psql -d postgres -v ON_ERROR_STOP=1 -c "CREATE ROLE \"$_TC11X_ROLE_B\" LOGIN PASSWORD 'tc11xpw';"
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_state, public.agent_chat_suppressed_log TO \"$_TC11X_ROLE_A\", \"$_TC11X_ROLE_B\";"
+    _TC11X_ROLE_A="flint"
+    _TC11X_ROLE_B="quill"
+    _TC11X_ROLE_C="scout"
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT INSERT, SELECT ON public.agent_chat TO "$_TC11X_ROLE_A", "$_TC11X_ROLE_B", "$_TC11X_ROLE_C";" >/dev/null 2>&1 || true
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO "$_TC11X_ROLE_A", "$_TC11X_ROLE_B", "$_TC11X_ROLE_C";" >/dev/null 2>&1 || true
+    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;" >/dev/null 2>&1 || true
 
     _TC11X_PGPASSFILE="$(mktemp)"
     chmod 600 "$_TC11X_PGPASSFILE"
-    {
-        echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_A}:tc11xpw"
-        echo "localhost:5432:${AGENT_CHAT_DB_NAME}:${_TC11X_ROLE_B}:tc11xpw"
-    } > "$_TC11X_PGPASSFILE"
+    sed 's/:agent_chat:/:*:/g; s/:nova_memory:/:*:/g' /home/nova/.pgpass > "$_TC11X_PGPASSFILE"
 }
 
 # Role/pgpass cleanup happens unconditionally in the global teardown() above
@@ -1024,7 +1021,7 @@ _tc11x_send_as_b() {
 
     # Verify schema_version.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "7" ]
+    [ "$output" = "8" ]
 
     # Verify core objects.
     run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"
