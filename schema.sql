@@ -1036,7 +1036,14 @@ EXCEPTION WHEN insufficient_privilege THEN
     RAISE NOTICE 'Skipping postgres default privileges: current user is not a superuser';
 END $$;
 
-ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
+-- Default privileges for role nova. Wrapped so a non-superuser devtest apply
+-- can still succeed.
+DO $$
+BEGIN
+    ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
+END $$;
 
 -- Explicit table grants for nova-ecosystem agent roles
 GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;

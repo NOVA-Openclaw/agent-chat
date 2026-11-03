@@ -656,4 +656,15 @@ INSERT INTO public.schema_version (version, description)
 VALUES (8, 'agent-chat#34/#36: alert-only pair breaker, skipped status + applied ids, agent mute, fallback template')
 ON CONFLICT (version) DO NOTHING;
 
+-- ─── Nova default privileges (non-superuser dev/test compatibility) ─────────
+-- Wrapped so a non-superuser dev/test apply can still succeed; mirrors the
+-- schema.sql bootstrap path and keeps upgraded databases identical to fresh
+-- installs.
+DO $$
+BEGIN
+    ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
+EXCEPTION WHEN insufficient_privilege THEN
+    RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
+END $$;
+
 COMMIT;

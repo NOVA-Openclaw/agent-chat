@@ -3,30 +3,28 @@
 #
 # Coverage: TC-23-090..101
 #
-# Every test runs against its own disposable scratch database. Fixture roles
-# are created NOLOGIN and impersonated via SET SESSION AUTHORIZATION so no
-# passwords are needed and no LOGIN roles leak. The live agent_chat database
-# is never touched.
+# Admin/setup runs as the agentchat_test LOGIN role.  Fixture roles are unique
+# per-test LOGIN roles with a random "act_<random6>_<basename>" prefix.  Every
+# test runs against a disposable scratch database named agent_chat_test_issue23_cleanup_*.
 
 BATS_TEST_DIRNAME="$(cd "$(dirname "$BATS_TEST_FILENAME")" && pwd)"
 REPO_ROOT="$(cd "$BATS_TEST_DIRNAME/.." && pwd)"
 
-# Agent names used as fixtures (suffix with test number + pid to avoid leaks).
-_issue23_agent_name() {
-    printf '%s' "$1"
-}
+# shellcheck source=fixture-roles.bash
+source "$BATS_TEST_DIRNAME/fixture-roles.bash"
 
-_issue23_track_role() {
-    printf '%s\n' "$1" >> "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt"
+# Agent names used as fixtures (prefixed to avoid colliding with real roles).
+_issue23_agent_name() {
+    printf '%s_%s' "$ACT_PREFIX" "$1"
 }
 
 _issue23_setup_db() {
     local db_name="$1"
-    psql -d postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1
-    createdb "$db_name" >/dev/null
-    psql -d "$db_name" -f "$REPO_ROOT/schema.sql" >/dev/null 2>&1
+    act_admin_psql postgres -v ON_ERROR_STOP=1 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1
+    act_admin_psql postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
+    act_admin_psql "$db_name" -f "$REPO_ROOT/schema.sql" >/dev/null 2>&1
     for f in "$REPO_ROOT"/migrations/*.sql; do
-        psql -d "$db_name" -f "$f" >/dev/null 2>&1 || {
+        act_admin_psql "$db_name" -f "$f" >/dev/null 2>&1 || {
             echo "FAILED to apply $(basename "$f")" >&2
             return 1
         }
@@ -36,10 +34,16 @@ _issue23_setup_db() {
 _issue23_setup_roles() {
     local db_name="$1"
     shift
-    local role
+    local role fixture_role base_name
     for role in "$@"; do
-        psql -d postgres -v ON_ERROR_STOP=1 -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = '$role') THEN CREATE ROLE \"$role\" NOLOGIN; END IF; END \$\$;" >/dev/null
-        psql -d "$db_name" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SCHEMA public TO \"$role\"; GRANT INSERT, SELECT ON public.agent_chat TO \"$role\"; GRANT INSERT, SELECT, UPDATE ON public.agent_chat_processed TO \"$role\"; GRANT SELECT ON public.agent_chat_error_templates, public.agent_chat_breaker_config, public.agent_chat_breaker_state, public.agent_chat_breaker_alerts, public.agent_chat_mutes, public.agent_chat_suppressed_log TO \"$role\";" >/dev/null
+        fixture_role="$(_issue23_agent_name "$role")"
+        # Accept either a base name ("coder") or an already-prefixed name ("$coder").
+        if [[ "$role" == "${ACT_PREFIX}_"* ]]; then
+            base_name="${role#${ACT_PREFIX}_}"
+        else
+            base_name="$role"
+        fi
+        act_create_fixture_role "$ACT_PREFIX" "$base_name" "$db_name" >/dev/null
     done
 }
 
@@ -47,30 +51,29 @@ _issue23_psql_as() {
     local db_name="$1"
     local role="$2"
     local sql="$3"
-    psql -d "$db_name" -At -v ON_ERROR_STOP=1 -c "SET SESSION AUTHORIZATION \"$role\"; $sql"
+    local fixture_role
+    fixture_role="$(_issue23_agent_name "$role")"
+    act_fixture_psql "$fixture_role" "$db_name" -At -c "$sql"
 }
 
 # Terminate backends and force-drop a per-test scratch database.
 _issue23_teardown_db() {
     local db_name="$1"
     [ -n "$db_name" ] || return 0
-    psql -d postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
-    dropdb --if-exists --force "$db_name" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -At -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '$db_name' AND pid <> pg_backend_pid();" >/dev/null 2>&1 || true
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP DATABASE IF EXISTS \"$db_name\";" >/dev/null 2>&1 || true
     pkill -f "install\.sh.*$db_name" 2>/dev/null || true
 }
 
 _issue23_run_cleanup() {
     local db_name="$1"
-    psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/007-agent-chat-23-one-time-cleanup.sql" >/dev/null 2>&1
-}
-
-setup_file() {
-    : > "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt"
+    act_admin_psql "$db_name" -f "$REPO_ROOT/migrations/007-agent-chat-23-one-time-cleanup.sql" >/dev/null 2>&1
 }
 
 setup() {
-    FAKE_HOME="$(mktemp -d)"
-    AGENT_CHAT_DB_NAME="agent_chat_issue23_cleanup_${BATS_TEST_NUMBER}_$$"
+    ACT_PGPASSFILE="$(act_init_pgpass)"
+    ACT_PREFIX="act_$(act_random_suffix)"
+    AGENT_CHAT_DB_NAME="agent_chat_test_issue23_cleanup_${BATS_TEST_NUMBER}_$$"
     _ISSUE23_ROLES=()
     _issue23_setup_db "$AGENT_CHAT_DB_NAME"
 }
@@ -79,18 +82,10 @@ teardown() {
     _issue23_teardown_db "${AGENT_CHAT_DB_NAME:-}"
     if [ ${#_ISSUE23_ROLES[@]} -gt 0 ]; then
         for role in "${_ISSUE23_ROLES[@]}"; do
-            psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
+            act_drop_fixture_role "$(_issue23_agent_name "$role")" >/dev/null 2>&1 || true
         done
     fi
-    rm -rf "$FAKE_HOME"
-}
-
-teardown_file() {
-    if [ -s "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt" ]; then
-        while IFS= read -r role; do
-            [ -n "$role" ] && psql -d postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$role\";" >/dev/null 2>&1 || true
-        done < "$BATS_FILE_TMPDIR/issue23_cleanup_roles.txt"
-    fi
+    rm -f "${ACT_PGPASSFILE:-}"
 }
 
 # ─── Requirement 7 cleanup cases ────────────────────────────────────────────
@@ -101,7 +96,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$coder")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (500, 'nova', 'old msg', ARRAY['$coder'], NOW() - interval '10 days');
@@ -113,7 +108,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || CASE WHEN expired_at IS NOT NULL THEN 'yes' ELSE 'no' END FROM public.agent_chat_processed WHERE chat_id = 500 AND agent = '$coder';"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || CASE WHEN expired_at IS NOT NULL THEN 'yes' ELSE 'no' END FROM public.agent_chat_processed WHERE chat_id = 500 AND agent = '$coder';"
     [ "$status" -eq 0 ]
     [ "$output" = "expired|yes" ]
 }
@@ -128,7 +123,7 @@ teardown_file() {
     # (strictly older). Because NOW() moves between INSERT and cleanup, an
     # "exactly 7 days" row cannot be tested reliably; instead we use a row one
     # second inside the 7-day window to document the exclusive boundary.
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (501, 'nova', 'just inside 7d window', ARRAY['$coder'], NOW() - interval '7 days' + interval '1 second');
@@ -140,7 +135,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status FROM public.agent_chat_processed WHERE chat_id = 501 AND agent = '$coder';"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT status FROM public.agent_chat_processed WHERE chat_id = 501 AND agent = '$coder';"
     [ "$status" -eq 0 ]
     [ "$output" = "routed" ]
 }
@@ -151,7 +146,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$coder")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\") VALUES
             (5021, 'nova', 'just under', ARRAY['$coder'], NOW() - (interval '7 days' - interval '1 second')),
@@ -165,7 +160,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE chat_id IN (5021, 5022) ORDER BY chat_id;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE chat_id IN (5021, 5022) ORDER BY chat_id;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"5021|routed"* ]]
     [[ "$output" == *"5022|expired"* ]]
@@ -177,7 +172,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$coder")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (502, 'nova', 'never picked up', ARRAY['$coder'], NOW() - interval '10 days');
@@ -187,7 +182,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || CASE WHEN expired_at IS NOT NULL THEN 'yes' ELSE 'no' END FROM public.agent_chat_processed WHERE chat_id = 502 AND agent = '$coder';"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT status || '|' || CASE WHEN expired_at IS NOT NULL THEN 'yes' ELSE 'no' END FROM public.agent_chat_processed WHERE chat_id = 502 AND agent = '$coder';"
     [ "$status" -eq 0 ]
     [ "$output" = "expired|yes" ]
 }
@@ -199,7 +194,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$coder" "$scribe")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder" "$scribe"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (503, 'nova', 'partial pickup', ARRAY['$coder', '$scribe'], NOW() - interval '10 days');
@@ -211,34 +206,34 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT agent || '|' || status FROM public.agent_chat_processed WHERE chat_id = 503 ORDER BY agent;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT agent || '|' || status FROM public.agent_chat_processed WHERE chat_id = 503 ORDER BY agent;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"$coder|expired"* ]]
     [[ "$output" == *"$scribe|expired"* ]]
 }
 
 @test "TC-23-095: broadcast '*' recipient excluded entirely" {
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (504, 'nova', 'broadcast old', ARRAY['*'], NOW() - interval '10 days');
         SELECT setval('public.agent_chat_id_seq', 1000);
     " >/dev/null
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 504;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 504;"
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
 
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 504;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 504;"
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
 }
 
 @test "TC-23-096: agent='main' rows stay exactly as they are" {
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\") VALUES
             (600, 'nova', 'main old routed', ARRAY['nova'], NOW() - interval '10 days'),
@@ -254,7 +249,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE agent = 'main' ORDER BY chat_id;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE agent = 'main' ORDER BY chat_id;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"600|routed"* ]]
     [[ "$output" == *"601|received"* ]]
@@ -268,7 +263,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$coder" "$scribe")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder" "$scribe"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\")
             VALUES (700, 'nova', 'idempotent test', ARRAY['$coder', '$scribe'], NOW() - interval '10 days');
@@ -280,18 +275,18 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 700;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 700;"
     [ "$status" -eq 0 ]
     local after_first="$output"
 
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 700;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id = 700;"
     [ "$status" -eq 0 ]
     [ "$output" = "$after_first" ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT agent || '|' || status FROM public.agent_chat_processed WHERE chat_id = 700 ORDER BY agent;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT agent || '|' || status FROM public.agent_chat_processed WHERE chat_id = 700 ORDER BY agent;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"$coder|expired"* ]]
     [[ "$output" == *"$scribe|expired"* ]]
@@ -304,7 +299,7 @@ teardown_file() {
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$coder"
 
     # Only a recent, unresolved row and an already-terminal old row.
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\") VALUES
             (800, 'nova', 'recent', ARRAY['$coder'], NOW() - interval '1 hour'),
@@ -317,7 +312,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE chat_id IN (800, 801) ORDER BY chat_id;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, status FROM public.agent_chat_processed WHERE chat_id IN (800, 801) ORDER BY chat_id;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"801|responded"* ]]
     [ "$(printf '%s' "$output" | grep -c '^800|')" -eq 0 ]
@@ -350,7 +345,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$athena" "$conductor" "$erato")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$athena" "$conductor" "$erato"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\") VALUES
             (900, 'nova', '1h received',     ARRAY['$athena'],     NOW() - interval '1 hour'),
@@ -376,7 +371,7 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id || '|' || agent || '|' || status FROM public.agent_chat_processed WHERE chat_id BETWEEN 900 AND 907 ORDER BY chat_id;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id || '|' || agent || '|' || status FROM public.agent_chat_processed WHERE chat_id BETWEEN 900 AND 907 ORDER BY chat_id;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"900|$athena|received"* ]]
     [[ "$output" == *"901|$conductor|routed"* ]]
@@ -395,7 +390,7 @@ teardown_file() {
     _ISSUE23_ROLES=("$athena" "$conductor")
     _issue23_setup_roles "$AGENT_CHAT_DB_NAME" "$athena" "$conductor"
 
-    psql -d "$AGENT_CHAT_DB_NAME" -v ON_ERROR_STOP=1 -c "
+    act_admin_psql "$AGENT_CHAT_DB_NAME" -c "
         ALTER TABLE public.agent_chat DISABLE TRIGGER trg_enforce_agent_chat_function_use;
         INSERT INTO public.agent_chat (id, sender, message, recipients, \"timestamp\") VALUES
             (1000, 'nova', 'broadcast 40d', ARRAY['*'], NOW() - interval '40 days'),
@@ -408,11 +403,11 @@ teardown_file() {
     run _issue23_run_cleanup "$AGENT_CHAT_DB_NAME"
     [ "$status" -eq 0 ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id IN (1000, 1001);"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT count(*) FROM public.agent_chat_processed WHERE chat_id IN (1000, 1001);"
     [ "$status" -eq 0 ]
     [ "$output" = "0" ]
 
-    run psql -d "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, agent, status FROM public.agent_chat_processed WHERE chat_id IN (1002, 1003) ORDER BY chat_id;"
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT chat_id, agent, status FROM public.agent_chat_processed WHERE chat_id IN (1002, 1003) ORDER BY chat_id;"
     [ "$status" -eq 0 ]
     [[ "$output" == *"1002|$athena|expired"* ]]
     [[ "$output" == *"1003|$conductor|expired"* ]]
