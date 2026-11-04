@@ -416,8 +416,8 @@ function formatIntervalWindow(windowStart: Date, windowEnd: Date): string {
 
 /**
  * Inject a breaker alert as a wake into the per-peer session for the OTHER
- * agent in the pair. The alert is marked seen before dispatch so a crash does
- * not cause endless re-alerting.
+ * agent in the pair. The alert is marked seen ONLY after the dispatch succeeds
+ * so a failed injection remains pending and can be retried.
  */
 export async function injectBreakerAlert(options: {
   alert: AgentChatBreakerAlert;
@@ -440,11 +440,6 @@ export async function injectBreakerAlert(options: {
     log?.debug?.(`Breaker alert ${alert.alert_id} has no distinct peer; skipping injection`);
     return;
   }
-
-  // Mark the alert seen before dispatching so we do not loop on it.
-  await client.query(`SELECT agent_chat_mark_alerts_seen($1::int[])`, [
-    [alert.alert_id],
-  ]);
 
   const windowText = formatIntervalWindow(alert.window_start, alert.window_end);
   const alertText =
@@ -501,6 +496,13 @@ export async function injectBreakerAlert(options: {
       replyOptions,
     });
     markDispatchIdle();
+
+    // Mark the alert seen only after successful injection. A failed dispatch
+    // leaves seen_at NULL so the next poll/notification retries it.
+    await client.query(`SELECT agent_chat_mark_alerts_seen($1::int[])`, [
+      [alert.alert_id],
+    ]);
+
     log?.info?.(`Breaker alert ${alert.alert_id} injected into session ${sessionLabel}`);
     await dispatcher.waitForIdle();
   } catch (err) {

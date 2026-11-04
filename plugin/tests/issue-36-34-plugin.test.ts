@@ -699,6 +699,43 @@ describe("I02: breaker alert injected into per-peer session", () => {
     assert.match(String(capturedCtx?.Body), /you and nova exchanged 6 agent_chat messages/);
     assert.match(String(capturedCtx?.Body), /agent_chat_mute/);
   });
+
+  it("does NOT mark alert seen when dispatch fails", async () => {
+    const runtime = makeBaseRuntime();
+    (runtime.channel!.reply as Record<string, unknown>).dispatchReplyFromConfig =
+      async () => {
+        throw new Error("prepared reply dispatch runtime owner was not published");
+      };
+    setAgentChatRuntime(runtime);
+
+    const fakeClient = makeFakeClient();
+    const fakeCtx = makeFakeCtx();
+
+    const alert = {
+      alert_id: 8,
+      pair_a: "newhart",
+      pair_b: "nova",
+      window_start: new Date("2026-10-02T19:00:00Z"),
+      window_end: new Date("2026-10-02T19:05:00Z"),
+      message_count: 6,
+      threshold: 6,
+      created_at: new Date("2026-10-02T19:05:00Z"),
+    };
+
+    await injectBreakerAlert({
+      alert,
+      client: fakeClient as unknown as import("pg").Client,
+      agentName: "newhart",
+      cfg: fakeCtx.cfg,
+      ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
+      runtime,
+    });
+
+    const seenQuery = fakeClient.queries.find((q) =>
+      q.sql.trim().toLowerCase().startsWith("select agent_chat_mark_alerts_seen"),
+    );
+    assert.ok(!seenQuery, "alert must stay unseen when dispatch fails");
+  });
 });
 
 // ---------------------------------------------------------------------------

@@ -158,9 +158,16 @@ _ensure_agent_chat_postgres_json() {
     return 1
   fi
 
+  # If the caller explicitly set AGENT_CHAT_DB_NAME, honor it by overwriting
+  # any existing flat agentChatDatabase key. Otherwise only seed the key when
+  # it is absent.
+  local force_db_json="false"
+  [ -n "${AGENT_CHAT_DB_NAME:-}" ] && force_db_json="true"
+
   local new_json
-  new_json=$(jq --arg db "$database" --arg user "$user" --arg pass "$password" \
-    'if (.agentChatDatabase // null) | type == "string" then . else .agentChatDatabase = $db end
+  new_json=$(jq --argjson force_db "$force_db_json" --arg db "$database" --arg user "$user" --arg pass "$password" \
+    'if $force_db then .agentChatDatabase = $db else . end
+     | if (.agentChatDatabase // null) | type == "string" then . else .agentChatDatabase = $db end
      | if (.agent_chat // null) | type == "object" then
          .agent_chat |= . + {
              database: (.database // $db),
@@ -196,10 +203,12 @@ _ensure_openclaw_config() {
 
   local new_json
 
-  # channels.agent_chat: strip dead connection keys, ensure enabled true.
-  new_json=$(jq '.channels.agent_chat |= ((. // {}) | del(.database, .host, .port, .user, .password) + {"enabled": true})' "$config") || return 1
-  # plugins.entries.agent_chat: enabled + routeToSession main, strip dead keys.
-  new_json=$(jq '.plugins.entries.agent_chat |= (. + {"enabled": true} | .config |= ((. // {}) | del(.database, .host, .port, .user, .password) + {"routeToSession": "main"}))' <<< "$new_json") || return 1
+  # channels.agent_chat: strip dead connection keys. The plugin manifest's
+  # channelConfigs schema rejects additionalProperties, so we do NOT write
+  # legacy keys like "enabled" or "routeToSession".
+  new_json=$(jq '.channels.agent_chat |= ((. // {}) | del(.database, .host, .port, .user, .password, .enabled))' "$config") || return 1
+  # plugins.entries.agent_chat: enabled + database only, strip dead keys.
+  new_json=$(jq '.plugins.entries.agent_chat |= (. + {"enabled": true} | .config |= ((. // {}) | del(.database, .host, .port, .user, .password, .routeToSession)))' <<< "$new_json") || return 1
 
   printf '%s\n' "$new_json" >"${config}.tmp" && mv "${config}.tmp" "$config"
 }
@@ -258,6 +267,19 @@ _sync_plugin() {
     "$PLUGIN_SOURCE/" "$PLUGIN_TARGET/"
 
   echo -e "  ${CHECK_MARK} Synced plugin to $PLUGIN_TARGET"
+
+  # Install production dependencies in the target extension directory. The
+  # rsync excludes node_modules, and the gateway's plugin loader verifies
+  # runtime dependencies (including transitive ones) are present.
+  if [ -f "$PLUGIN_TARGET/package.json" ]; then
+    echo "Installing production dependencies in $PLUGIN_TARGET..."
+    if (cd "$PLUGIN_TARGET" && npm ci --omit=dev >/dev/null 2>&1); then
+      echo -e "  ${CHECK_MARK} Production dependencies installed"
+    else
+      echo -e "  ${CROSS_MARK} Failed to install production dependencies in $PLUGIN_TARGET" >&2
+      return 1
+    fi
+  fi
 }
 
 # Fix openclaw.plugin.json main field ----------------------------------------

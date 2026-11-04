@@ -1226,11 +1226,13 @@ EOF
     AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "testpass"
     [ "$status" -eq 0 ]
 
-    [ "$(jq -r '.channels.agent_chat.enabled' "$oc_dir/openclaw.json")" = "true" ]
+    # channels.agent_chat must not contain keys rejected by the plugin schema.
+    [ "$(jq -r '.channels.agent_chat.enabled' "$oc_dir/openclaw.json")" = "null" ]
     [ "$(jq -r '.channels.agent_chat.database' "$oc_dir/openclaw.json")" = "null" ]
     [ "$(jq -r '.channels.agent_chat.pollIntervalMs' "$oc_dir/openclaw.json")" = "500" ]
     [ "$(jq -r '.plugins.entries.agent_chat.enabled' "$oc_dir/openclaw.json")" = "true" ]
-    [ "$(jq -r '.plugins.entries.agent_chat.config.routeToSession' "$oc_dir/openclaw.json")" = "main" ]
+    # plugins.entries.agent_chat.config must not contain legacy routeToSession.
+    [ "$(jq -r '.plugins.entries.agent_chat.config.routeToSession' "$oc_dir/openclaw.json")" = "null" ]
     [ "$(jq -r '.plugins.entries.agent_chat.config.password' "$oc_dir/openclaw.json")" = "null" ]
 }
 
@@ -1243,11 +1245,42 @@ EOF
     AGENT_CHAT_DB_NAME="agent_chat" "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "testpass" >/dev/null
     AGENT_CHAT_DB_NAME="agent_chat" "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "testpass" >/dev/null
 
+    # With an empty starting config, the plugin schema leaves these objects empty.
     run jq '.channels.agent_chat | keys | length' "$oc_dir/openclaw.json"
-    [ "$output" -eq 1 ]
+    [ "$output" -eq 0 ]
 
     run jq '.plugins.entries.agent_chat.config | keys | length' "$oc_dir/openclaw.json"
-    [ "$output" -eq 1 ]
+    [ "$output" -eq 0 ]
+}
+
+@test "TC-60: install-plugin.sh honors AGENT_CHAT_DB_NAME in postgres.json" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    cat > "$oc_dir/postgres.json" <<'EOF'
+{
+  "agentChatDatabase": "agent_chat"
+}
+EOF
+    echo '{}' > "$oc_dir/openclaw.json"
+
+    AGENT_CHAT_DB_NAME="agent_chat_staging" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -r '.agentChatDatabase' "$oc_dir/postgres.json")" = "agent_chat_staging" ]
+    [ "$(jq -r '.agent_chat.database' "$oc_dir/postgres.json")" = "agent_chat_staging" ]
+}
+
+@test "TC-60: install-plugin.sh installs production dependencies in target dir" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    echo '{}' > "$oc_dir/openclaw.json"
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    [ -d "$oc_dir/extensions/agent_chat/node_modules" ]
+    [ -d "$oc_dir/extensions/agent_chat/node_modules/pg" ]
 }
 
 @test "TC-60: install-plugin.sh fixes openclaw.plugin.json main field" {
