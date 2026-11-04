@@ -76,6 +76,29 @@ _check_privileges() {
   fi
 }
 
+_check_owner_assignment_privileges() {
+  # schema.sql uses ALTER FUNCTION ... OWNER TO postgres so SECURITY DEFINER
+  # functions are owned by postgres. That requires the installing role to be
+  # able to SET ROLE postgres (superuser, or member of the postgres role).
+  # In tests PGOPTIONS="-c agent_chat.devtest=on" skips this gate.
+  local devtest
+  devtest=$(psql -d postgres -v ON_ERROR_STOP=1 -At -c "SELECT COALESCE(current_setting('agent_chat.devtest', true), '') = 'on';" 2>/dev/null || echo "f")
+  if [ "$devtest" = "t" ]; then
+    echo -e "  ${INFO} agent_chat.devtest=on; skipping postgres owner-assignment privilege check"
+    return 0
+  fi
+
+  local can_set_role_postgres
+  can_set_role_postgres=$(psql -d postgres -v ON_ERROR_STOP=1 -At -c "SELECT (SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = session_user) OR pg_catalog.pg_has_role(session_user, 'postgres', 'MEMBER');" 2>/dev/null || echo "f")
+  if [ "$can_set_role_postgres" != "t" ]; then
+    echo -e "  ${CROSS_MARK} Role '${PGUSER:-$(whoami)}' cannot SET ROLE postgres" >&2
+    echo "      install.sh must be run as a PostgreSQL superuser (or as the postgres role) so that" >&2
+    echo "      SECURITY DEFINER functions can be assigned to postgres. Tests may set" >&2
+    echo "      PGOPTIONS=\"-c agent_chat.devtest=on\" to skip this check." >&2
+    return 1
+  fi
+}
+
 # Database creation -----------------------------------------------------------
 
 _create_database() {
@@ -274,9 +297,10 @@ main() {
   # Load PG* env from postgres.json (never touches live DB).
   load_pg_env
 
-  # Validate connection before any side effects.
+  # Validate connection and privileges before any side effects.
   _check_connectivity
   _check_privileges
+  _check_owner_assignment_privileges
 
   local db_existed=0
   if _ensure_database "$DB_NAME"; then

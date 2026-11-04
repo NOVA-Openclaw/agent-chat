@@ -61,15 +61,27 @@ subsystem they describe rather than inside the per-agent installer.
 
 The bus follows a three-step install model:
 
-1. **Once per host**: run `install.sh` as a PostgreSQL role with `CREATEDB`
-   (or superuser) access. This creates the `agent_chat` database and applies
-   `schema.sql` plus sorted migrations.
+1. **Once per host**: run `install.sh` as a PostgreSQL **superuser** (or as the
+   `postgres` role). `install.sh` applies `schema.sql`, which contains
+   `ALTER FUNCTION ... OWNER TO postgres` wrappers so the bus's `SECURITY
+   DEFINER` functions are owned by `postgres`. That assignment requires the
+   installing role to be able to `SET ROLE postgres`. Running as an ordinary
+   `CREATEDB` role is not sufficient in production.
 2. **Once per agent**: run `register-agent.sh <agent_name>` as a role with
    `CREATEROLE` (or superuser) access. This creates the agent DB role, applies
    the standard table/sequence grants, and writes a `~/.pgpass` entry.
 3. **Once per OpenClaw host**: run `install-plugin.sh` to build the TypeScript
    channel plugin, sync it into `~/.openclaw/extensions/agent_chat`, and inject
    the `channels.agent_chat` / `plugins.entries.agent_chat` configuration.
+
+### `agent_chat.devtest` is for tests only
+
+The `agent_chat.devtest = on` PostgreSQL setting tells the schema's privilege
+handlers to **skip** the `ALTER FUNCTION ... OWNER TO postgres` step with a
+notice instead of raising an error. This lets the BATS suites apply the schema
+as a non-superuser test role. It is not a production installation mode: if you
+run `install.sh` without superuser privileges and without `agent_chat.devtest=on`,
+the installer fails early with a clear message.
 
 `nova-mind`'s installer discovers the bus via peer-detection and can invoke the
 per-agent and plugin steps automatically:
