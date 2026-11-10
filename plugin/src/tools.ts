@@ -79,7 +79,7 @@ function toolResultError(message: string): {
 
 export interface AgentChatToolsOptions {
   createClient: () => pg.Client;
-  resolveAgentName: () => string;
+  resolveDbUser: () => string;
 }
 
 /**
@@ -96,8 +96,8 @@ export function createAgentChatTools(
       return null;
     }
 
-    const agentName = options.resolveAgentName();
-    if (!agentName) {
+    const dbUser = options.resolveDbUser();
+    if (!dbUser) {
       return null;
     }
 
@@ -124,7 +124,7 @@ export function createAgentChatTools(
           await client.connect();
           const result = await client.query<{ id: number | null }>(
             `SELECT send_agent_message($1::text, $2::text, $3::text[], p_ttl => $4::interval, p_reply_to => $5::integer) AS id`,
-            [agentName, text, recipients, null, replyTo],
+            [dbUser, text, recipients, null, replyTo],
           );
           const id = result.rows[0]?.id;
           if (id == null) {

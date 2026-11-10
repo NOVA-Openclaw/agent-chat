@@ -19,10 +19,9 @@ const { Client } = pg;
 const PLUGIN_ID = "agent_chat";
 
 /**
- * Resolve the agent name from the agent_chat DB config user.
- * The DB user is authoritative because send_agent_message() enforces
- * sender = session_user; cfg.agents.list cannot be trusted on newer
- * gateway builds where default markers are removed from the projection.
+ * Resolve the DB user name from the agent_chat DB config.
+ * The DB user is authoritative for message provenance because
+ * send_agent_message() enforces sender = session_user.
  */
 export function resolveAgentNameFromPgConfig(pgCfg: { user?: string | null }): string {
   const raw = pgCfg.user;
@@ -32,31 +31,141 @@ export function resolveAgentNameFromPgConfig(pgCfg: { user?: string | null }): s
   return String(raw).toLowerCase();
 }
 
-export function resolveAgentName(_cfg?: OpenClawConfig): string {
+/** The connected PostgreSQL role used for sends and processed-row ownership. */
+export function resolveDbUser(): string {
   return resolveAgentNameFromPgConfig(pgConfig);
+}
+
+function normalizeAgentId(raw: unknown): string {
+  if (typeof raw !== "string" || !raw) {
+    return "";
+  }
+  return raw.toLowerCase();
+}
+
+function resolveSoleConfiguredAgentId(cfg: OpenClawConfig): string | undefined {
+  const entries = (cfg as { agents?: { entries?: Record<string, unknown> } }).agents?.entries;
+  if (entries && typeof entries === "object" && !Array.isArray(entries)) {
+    const keys = Object.keys(entries);
+    if (keys.length === 1) {
+      return normalizeAgentId(keys[0]);
+    }
+    for (const key of keys) {
+      const entry = entries[key] as { default?: boolean } | undefined;
+      if (entry?.default === true) {
+        return normalizeAgentId(key);
+      }
+    }
+  }
+
+  const list = (cfg as { agents?: { list?: Array<{ id?: string; default?: boolean }> } }).agents
+    ?.list;
+  if (Array.isArray(list)) {
+    if (list.length === 1) {
+      return normalizeAgentId(list[0]?.id);
+    }
+    for (const entry of list) {
+      if (entry?.default === true) {
+        return normalizeAgentId(entry.id);
+      }
+    }
+  }
+
+  return undefined;
+}
+
+function resolveExplicitAgentIdFromChannelConfig(
+  cfg: OpenClawConfig,
+  accountId?: string,
+): string | undefined {
+  const channelConfig = (cfg as { channels?: { agent_chat?: unknown } }).channels?.agent_chat;
+  if (!channelConfig || typeof channelConfig !== "object" || Array.isArray(channelConfig)) {
+    return undefined;
+  }
+  const topLevel = (channelConfig as { agentId?: string }).agentId;
+  if (topLevel) {
+    return normalizeAgentId(topLevel);
+  }
+  const accounts = (channelConfig as { accounts?: Record<string, { agentId?: string }> }).accounts;
+  if (accounts && typeof accounts === "object") {
+    const id = accountId && accountId !== "default" ? accountId : "default";
+    const account = accounts[id];
+    if (account?.agentId) {
+      return normalizeAgentId(account.agentId);
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Resolve the OpenClaw gateway agent id that should own agent_chat sessions.
+ *
+ * The dispatch runtime matches the `agent:<id>:...` session key against
+ * configured gateway agents, so this id must be the gateway's own agent id
+ * (e.g. "main"), not the PostgreSQL role name used for the bus connection.
+ *
+ * Resolution order:
+ *   1. Explicit `channels.agent_chat.agentId` (or per-account `agentId`).
+ *   2. Sole or default agent from `cfg.agents.entries` / `cfg.agents.list`.
+ *   3. Fallback to the DB user for backward compatibility.
+ */
+export function resolveGatewayAgentId(
+  cfg?: OpenClawConfig,
+  accountId?: string,
+): string {
+  if (cfg) {
+    const explicit = resolveExplicitAgentIdFromChannelConfig(cfg, accountId);
+    if (explicit) {
+      return explicit;
+    }
+    const sole = resolveSoleConfiguredAgentId(cfg);
+    if (sole) {
+      return sole;
+    }
+  }
+  return resolveDbUser();
+}
+
+/**
+ * @deprecated Use resolveDbUser() for the DB role or resolveGatewayAgentId(cfg)
+ * for the dispatch/session agent id.
+ */
+export function resolveAgentName(_cfg?: OpenClawConfig): string {
+  return resolveDbUser();
 }
 
 /** Result of validating the agent_chat plugin configuration. */
 export type AgentChatConfigValidation =
-  | { ok: true; agentName: string }
+  | { ok: true; dbUser: string; gatewayAgentId: string }
   | { ok: false; error: string };
 
 /**
  * Validate that the plugin has enough configuration to start monitoring.
- * The agent name is derived from pgConfig.user, not from cfg.agents.list.
+ * Requires both a DB user (for message provenance) and a gateway agent id
+ * (for dispatch/session ownership).
  */
-export function validateAgentChatConfig(): AgentChatConfigValidation {
-  const agentName = resolveAgentName();
-  if (!agentName) {
+export function validateAgentChatConfig(cfg?: OpenClawConfig): AgentChatConfigValidation {
+  const dbUser = resolveDbUser();
+  if (!dbUser) {
     return {
       ok: false,
       error:
-        "agent_chat: cannot start monitor — no agent name could be resolved from " +
+        "agent_chat: cannot start monitor — no DB user could be resolved from " +
         "the DB config (pgConfig.user). Please set agent_chat.user in postgres.json " +
         "or the PGUSER environment variable.",
     };
   }
-  return { ok: true, agentName };
+  const gatewayAgentId = resolveGatewayAgentId(cfg);
+  if (!gatewayAgentId) {
+    return {
+      ok: false,
+      error:
+        "agent_chat: cannot start monitor — no gateway agent id could be resolved. " +
+        "Please configure a sole/default agent, set channels.agent_chat.agentId, " +
+        "or ensure agent_chat.user matches a configured gateway agent id.",
+    };
+  }
+  return { ok: true, dbUser, gatewayAgentId };
 }
 
 /** Input to the inbound envelope formatter. */
@@ -422,21 +531,24 @@ function formatIntervalWindow(windowStart: Date, windowEnd: Date): string {
 export async function injectBreakerAlert(options: {
   alert: AgentChatBreakerAlert;
   client: pg.Client;
-  agentName: string;
+  dbUser: string;
+  gatewayAgentId: string;
   cfg: OpenClawConfig;
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>;
   runtime: PluginRuntime;
 }) {
-  const { alert, client, agentName, cfg, ctx, runtime } = options;
+  const { alert, client, dbUser, gatewayAgentId, cfg, ctx, runtime } = options;
   const log = ctx.log;
 
-  // Determine the peer (the other agent in the pair).
+  // Determine the peer (the other agent in the pair). Alert pair names are
+  // bus identities (DB roles), so compare against the DB user, not the
+  // gateway agent id.
   const peer =
-    alert.pair_a.toLowerCase() === agentName.toLowerCase()
+    alert.pair_a.toLowerCase() === dbUser.toLowerCase()
       ? alert.pair_b
       : alert.pair_a;
 
-  if (!peer || peer.toLowerCase() === agentName.toLowerCase()) {
+  if (!peer || peer.toLowerCase() === dbUser.toLowerCase()) {
     log?.debug?.(`Breaker alert ${alert.alert_id} has no distinct peer; skipping injection`);
     return;
   }
@@ -453,7 +565,7 @@ export async function injectBreakerAlert(options: {
     return;
   }
 
-  const sessionLabel = buildSessionLabel({ agentName, peer });
+  const sessionLabel = buildSessionLabel({ agentName: gatewayAgentId, peer });
 
   const ctxPayload = runtime.channel.reply.finalizeInboundContext({
     Body: alertText,
@@ -515,17 +627,17 @@ export async function injectBreakerAlert(options: {
  */
 async function checkPendingAlerts(
   client: pg.Client,
-  agentName: string,
+  dbUser: string,
   cfg: OpenClawConfig,
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>,
   runtime: PluginRuntime,
 ) {
   const result = await client.query<AgentChatBreakerAlert>(
     `SELECT * FROM agent_chat_pending_alerts($1::text)`,
-    [agentName],
+    [dbUser],
   );
   for (const alert of result.rows) {
-    await injectBreakerAlert({ alert, client, agentName, cfg, ctx, runtime });
+    await injectBreakerAlert({ alert, client, dbUser, gatewayAgentId: resolveGatewayAgentId(cfg, ctx.account?.accountId), cfg, ctx, runtime });
   }
 }
 
@@ -535,7 +647,8 @@ async function checkPendingAlerts(
 export async function processAgentChatMessage({
   message,
   client,
-  agentName,
+  dbUser,
+  gatewayAgentId,
   cfg,
   ctx,
 }: {
@@ -548,7 +661,8 @@ export async function processAgentChatMessage({
     timestamp: Date;
   };
   client: pg.Client;
-  agentName: string;
+  dbUser: string;
+  gatewayAgentId: string;
   cfg: OpenClawConfig;
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>;
 }) {
@@ -557,10 +671,11 @@ export async function processAgentChatMessage({
 
   log?.info?.(`Processing message ${message.id} from ${message.sender}`);
 
-  // Self-mention guard: prevent infinite loops
-  if (message.sender.toLowerCase() === agentName.toLowerCase()) {
+  // Self-mention guard: prevent infinite loops. Compare against the DB role
+  // because sender names are bus identities, not gateway agent ids.
+  if (message.sender.toLowerCase() === dbUser.toLowerCase()) {
     log?.debug?.(`Skipping self-mention from ${message.sender}`);
-    await claimMessage(client, message.id, agentName);
+    await claimMessage(client, message.id, dbUser);
     return;
   }
 
@@ -568,18 +683,18 @@ export async function processAgentChatMessage({
     // Mute check before waking. If the peer is muted we still claim the
     // message (so it does not keep being picked up) and leave it at 'routed'
     // without dispatching a turn.
-    const muted = await isPeerMuted(client, agentName, message.sender);
+    const muted = await isPeerMuted(client, dbUser, message.sender);
     if (muted) {
       log?.info?.(
         `Message ${message.id} from ${message.sender} suppressed: peer is muted`,
       );
-      await claimMessage(client, message.id, agentName);
-      await markMessageRouted(client, message.id, agentName);
+      await claimMessage(client, message.id, dbUser);
+      await markMessageRouted(client, message.id, dbUser);
       return;
     }
 
     // Atomically claim the message. Only the first worker/call creates the row.
-    const claim = await claimMessage(client, message.id, agentName);
+    const claim = await claimMessage(client, message.id, dbUser);
     if (!claim) {
       log?.debug?.(
         `Message ${message.id} already claimed by another worker or a prior run; skipping dispatch`,
@@ -599,7 +714,7 @@ export async function processAgentChatMessage({
       log?.error?.(
         `agent_chat: envelope formatting failed for message ${message.id}: ${envelopeResult.error}`,
       );
-      await markMessageFailed(client, message.id, agentName, envelopeResult.error);
+      await markMessageFailed(client, message.id, dbUser, envelopeResult.error);
       return;
     }
 
@@ -613,11 +728,11 @@ export async function processAgentChatMessage({
     const funcCheck = checkDeprecatedReplyFunctions(runtime);
     if (!funcCheck.ok) {
       log?.error?.(`agent_chat: ${funcCheck.error}`);
-      await markMessageFailed(client, message.id, agentName, funcCheck.error);
+      await markMessageFailed(client, message.id, dbUser, funcCheck.error);
       return;
     }
 
-    const sessionLabel = buildSessionLabel({ agentName, peer: message.sender });
+    const sessionLabel = buildSessionLabel({ agentName: gatewayAgentId, peer: message.sender });
 
     const ctxPayload = runtime.channel.reply.finalizeInboundContext({
       Body: body,
@@ -671,7 +786,7 @@ export async function processAgentChatMessage({
       markDispatchIdle();
 
       log?.info?.(`✅ Successfully dispatched message ${message.id}`);
-      await markMessageRouted(client, message.id, agentName);
+      await markMessageRouted(client, message.id, dbUser);
 
       // Wait for any async deliver() work to finish before returning.
       await dispatcher.waitForIdle();
@@ -680,13 +795,13 @@ export async function processAgentChatMessage({
       await markMessageFailed(
         client,
         message.id,
-        agentName,
+        dbUser,
         (dispatchError as Error).message,
       );
     }
   } catch (error) {
     // Mark as failed if routing fails
-    await markMessageFailed(client, message.id, agentName, (error as Error).message);
+    await markMessageFailed(client, message.id, dbUser, (error as Error).message);
     log?.error?.(`Failed to route message ${message.id}: ${error}`);
   }
 }
@@ -700,14 +815,14 @@ async function startAgentChatMonitor(
   const { pollIntervalMs } = ctx.account.config;
   const log = ctx.log;
 
-  const validation = validateAgentChatConfig();
+  const validation = validateAgentChatConfig(ctx.cfg);
   if (!validation.ok) {
     log?.error?.(validation.error);
     throw new Error(validation.error);
   }
-  const agentName = validation.agentName;
+  const { dbUser, gatewayAgentId } = validation;
 
-  log?.info?.(`Starting monitor for agent: ${agentName}`);
+  log?.info?.(`Starting monitor for DB user ${dbUser} / gateway agent ${gatewayAgentId}`);
 
   const client = createPgClient();
   const runtime = getAgentChatRuntime();
@@ -733,15 +848,16 @@ async function startAgentChatMonitor(
 
         try {
           // Check breaker alerts before waking on new messages.
-          await checkPendingAlerts(client, agentName, ctx.cfg, ctx, runtime);
+          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
 
-          const messages = await fetchUnprocessedMessages(client, agentName);
+          const messages = await fetchUnprocessedMessages(client, dbUser);
 
           for (const message of messages) {
             await processAgentChatMessage({
               message,
               client,
-              agentName,
+              dbUser,
+              gatewayAgentId,
               cfg: ctx.cfg,
               ctx,
             });
@@ -752,7 +868,7 @@ async function startAgentChatMonitor(
       } else if (msg.channel === "agent_chat_breaker_alert") {
         log?.debug?.(`Received breaker alert notification`);
         try {
-          await checkPendingAlerts(client, agentName, ctx.cfg, ctx, runtime);
+          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
         } catch (error) {
           log?.error?.(`Error processing breaker alert notification: ${error}`);
         }
@@ -760,16 +876,17 @@ async function startAgentChatMonitor(
     });
 
     // Initial check for existing breaker alerts and unprocessed messages
-    await checkPendingAlerts(client, agentName, ctx.cfg, ctx, runtime);
+    await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
 
-    const initialMessages = await fetchUnprocessedMessages(client, agentName);
+    const initialMessages = await fetchUnprocessedMessages(client, dbUser);
     log?.info?.(`Found ${initialMessages.length} unprocessed messages on startup`);
 
     for (const message of initialMessages) {
       await processAgentChatMessage({
         message,
         client,
-        agentName,
+        dbUser,
+        gatewayAgentId,
         cfg: ctx.cfg,
         ctx,
       });
@@ -933,15 +1050,18 @@ export const agentChatPlugin: ChannelPlugin<ResolvedAgentChatAccount> = {
 
     defaultAccountId: () => "default",
 
-    isConfigured: (_account, _cfg) => Boolean(resolveAgentName()),
+    isConfigured: (_account, cfg) =>
+      Boolean(resolveDbUser()) && Boolean(resolveGatewayAgentId(cfg)),
 
-    describeAccount: (account, _cfg) => {
+    describeAccount: (account, cfg) => {
       return {
         accountId: account.accountId,
         name: account.name,
         enabled: account.enabled,
-        configured: Boolean(resolveAgentName()),
-        agentName: resolveAgentName(),
+        configured:
+          Boolean(resolveDbUser()) && Boolean(resolveGatewayAgentId(cfg)),
+        agentName: resolveGatewayAgentId(cfg, account.accountId),
+        dbUser: resolveDbUser(),
         database: pgConfig.database ?? null,
         host: pgConfig.host ?? "localhost",
       };
@@ -964,10 +1084,10 @@ export const agentChatPlugin: ChannelPlugin<ResolvedAgentChatAccount> = {
       try {
         await client.connect();
 
-        const agentName = resolveAgentName();
-        if (!agentName) {
+        const dbUser = resolveDbUser();
+        if (!dbUser) {
           throw new Error(
-            `agent_chat: cannot send — no agent name could be resolved from DB config (pgConfig.user)`,
+            `agent_chat: cannot send — no DB user could be resolved from pgConfig.user`,
           );
         }
 
@@ -975,7 +1095,7 @@ export const agentChatPlugin: ChannelPlugin<ResolvedAgentChatAccount> = {
         const recipientName = normalizeAgentChatMessagingTarget(to) || to;
 
         const result = await insertOutboundMessage(client, {
-          sender: agentName,
+          sender: dbUser,
           message: text,
           recipients: [recipientName],
           replyTo: null,
@@ -1015,19 +1135,21 @@ export const agentChatPlugin: ChannelPlugin<ResolvedAgentChatAccount> = {
       database: (snapshot.probe as { database?: string })?.database ?? null,
     }),
 
-    buildAccountSnapshot: ({ account, runtime, cfg: _cfg }) => {
+    buildAccountSnapshot: ({ account, runtime, cfg }) => {
       return {
         accountId: account.accountId,
         name: account.name,
         enabled: account.enabled,
-        configured: Boolean(resolveAgentName()),
+        configured:
+          Boolean(resolveDbUser()) && Boolean(resolveGatewayAgentId(cfg)),
         running: runtime?.running ?? false,
         lastStartAt: runtime?.lastStartAt ?? null,
         lastStopAt: runtime?.lastStopAt ?? null,
         lastError: runtime?.lastError ?? null,
         // Store custom info in probe
         probe: {
-          agentName: resolveAgentName(),
+          agentName: resolveGatewayAgentId(cfg, account.accountId),
+          dbUser: resolveDbUser(),
           database: pgConfig.database ?? null,
         },
       };

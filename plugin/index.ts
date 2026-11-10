@@ -1,7 +1,7 @@
 import type { OpenClawPluginApi } from "openclaw/plugin-sdk";
 import { createRequire } from "node:module";
 import pg from "pg";
-import { agentChatPlugin, createPgClient, resolveAgentName } from "./src/channel.js";
+import { agentChatPlugin, createPgClient, resolveDbUser, resolveGatewayAgentId } from "./src/channel.js";
 import { setAgentChatRuntime } from "./src/runtime.js";
 import { AgentChatConfigSchema } from "./src/config.js";
 import { createStartupDigestService } from "./src/digest.js";
@@ -40,7 +40,7 @@ const plugin = {
     // No DB connection is opened at register time; each execute() creates its own.
     const toolsFactory = createAgentChatTools({
       createClient: createPgClient,
-      resolveAgentName,
+      resolveDbUser,
     });
     api.registerTool(toolsFactory, { names: ["agent_chat_send", "agent_chat_mark", "agent_chat_mute"] });
 
@@ -52,7 +52,8 @@ const plugin = {
     if (registrationMode === "full") {
       const digestService = createStartupDigestService({
         runtime: api.runtime,
-        resolveAgentName,
+        resolveDbUser,
+        resolveGatewayAgentId,
         createClient: () => new pg.Client(pgConfig),
       });
       api.registerService(digestService);

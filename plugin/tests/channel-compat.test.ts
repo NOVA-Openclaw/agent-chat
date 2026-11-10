@@ -285,7 +285,8 @@ describe("TC-23-005: missing both envelope functions marks failed", () => {
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });
@@ -322,7 +323,8 @@ describe("TC-23-006: deprecated functions present are used normally", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -393,7 +395,8 @@ describe("TC-23-007: missing dispatchReplyFromConfig marks failed", () => {
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });

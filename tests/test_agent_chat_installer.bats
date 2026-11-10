@@ -1270,6 +1270,32 @@ EOF
     [ "$(jq -r '.agent_chat.database' "$oc_dir/postgres.json")" = "agent_chat_staging" ]
 }
 
+@test "TC-60: install-plugin.sh overwrites stale nested agent_chat.database when AGENT_CHAT_DB_NAME is set" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    cat > "$oc_dir/postgres.json" <<'EOF'
+{
+  "agentChatDatabase": "agent_chat",
+  "agent_chat": {
+    "database": "agent_chat_se1453_staging",
+    "user": "oldagent",
+    "password": "oldpass"
+  }
+}
+EOF
+    echo '{}' > "$oc_dir/openclaw.json"
+
+    AGENT_CHAT_DB_NAME="agent_chat_staging" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    # The flat key is forced by AGENT_CHAT_DB_NAME.
+    [ "$(jq -r '.agentChatDatabase' "$oc_dir/postgres.json")" = "agent_chat_staging" ]
+    # The nested key (the one the plugin actually reads) must also be updated.
+    [ "$(jq -r '.agent_chat.database' "$oc_dir/postgres.json")" = "agent_chat_staging" ]
+    # Other nested keys are preserved when not overridden.
+    [ "$(jq -r '.agent_chat.user' "$oc_dir/postgres.json")" = "oldagent" ]
+}
+
 @test "TC-60: install-plugin.sh installs production dependencies in target dir" {
     local oc_dir="$FAKE_HOME/.openclaw"
     mkdir -p "$oc_dir"

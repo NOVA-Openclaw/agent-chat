@@ -291,7 +291,8 @@ const firedByRuntime = new WeakMap<object, boolean>();
 /** Options for creating the startup digest service. */
 export interface StartupDigestServiceOptions {
   runtime: PluginRuntime;
-  resolveAgentName: () => string;
+  resolveDbUser: () => string;
+  resolveGatewayAgentId: (cfg?: OpenClawConfig) => string;
   createClient: () => pg.Client;
 }
 
@@ -306,7 +307,7 @@ export interface StartupDigestServiceOptions {
 export function createStartupDigestService(
   options: StartupDigestServiceOptions,
 ): OpenClawPluginService {
-  const { runtime, resolveAgentName, createClient } = options;
+  const { runtime, resolveDbUser, resolveGatewayAgentId, createClient } = options;
   let fired = false;
 
   return {
@@ -323,10 +324,11 @@ export function createStartupDigestService(
       firedByRuntime.set(runtime, true);
       fired = true;
 
-      const agentName = resolveAgentName();
-      if (!agentName) {
+      const dbUser = resolveDbUser();
+      const gatewayAgentId = resolveGatewayAgentId(ctx.config);
+      if (!dbUser || !gatewayAgentId) {
         ctx.logger.error?.(
-          "agent_chat: cannot run startup digest — no agent name could be resolved from pgConfig.user",
+          "agent_chat: cannot run startup digest — no DB user or gateway agent id could be resolved",
         );
         return;
       }
@@ -340,15 +342,15 @@ export function createStartupDigestService(
       const client = createClient();
       try {
         await client.connect();
-        const total = await countUnresolvedMessages(client, agentName);
+        const total = await countUnresolvedMessages(client, dbUser);
         if (total === 0) {
           ctx.logger.debug?.("agent_chat: no unresolved messages; skipping digest");
           return;
         }
 
-        const messages = await fetchUnresolvedMessages(client, agentName, DIGEST_CAP);
-        const digestText = buildDigestText({ agentName, messages, totalUnresolved: total });
-        await deliverDigest({ runtime, cfg: ctx.config, agentName, digestText, log: ctx.logger });
+        const messages = await fetchUnresolvedMessages(client, dbUser, DIGEST_CAP);
+        const digestText = buildDigestText({ agentName: dbUser, messages, totalUnresolved: total });
+        await deliverDigest({ runtime, cfg: ctx.config, agentName: gatewayAgentId, digestText, log: ctx.logger });
       } catch (err) {
         ctx.logger.error?.(`agent_chat startup digest failed: ${err}`);
       } finally {

@@ -251,7 +251,8 @@ describe("G03: inbound dispatch uses per-peer session key", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -260,6 +261,48 @@ describe("G03: inbound dispatch uses per-peer session key", () => {
       capturedCtx?.SessionKey,
       "agent:newhart:agent_chat:nova",
     );
+  });
+});
+
+describe("G04: session key uses gateway agent id while DB ops use DB user", () => {
+  it("dispatches under the gateway agent id and claims rows under the DB role", async () => {
+    const runtime = makeBaseRuntime();
+    let capturedCtx: Record<string, unknown> | undefined;
+    (runtime.channel!.reply as Record<string, unknown>).finalizeInboundContext = (
+      ctx: Record<string, unknown>,
+    ) => {
+      capturedCtx = ctx;
+      return ctx;
+    };
+    setAgentChatRuntime(runtime);
+
+    const fakeClient = makeFakeClient();
+    const fakeCtx = makeFakeCtx();
+
+    await processAgentChatMessage({
+      message: SAMPLE_MESSAGE,
+      client: fakeClient as unknown as import("pg").Client,
+      dbUser: "nova-staging",
+      gatewayAgentId: "main",
+      cfg: fakeCtx.cfg,
+      ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
+    });
+
+    // Dispatch session ownership must use the gateway agent id, not the DB role.
+    assert.strictEqual(capturedCtx?.SessionKey, "agent:main:agent_chat:nova");
+
+    // The processed-row claim must record the DB role so the bus state stays
+    // consistent with send_agent_message() provenance.
+    const claimQuery = fakeClient.queries.find((q) =>
+      q.sql.trim().toLowerCase().startsWith("insert into public.agent_chat_processed") &&
+      q.sql.toLowerCase().includes("returning"),
+    );
+    assert.ok(claimQuery, "expected a claim INSERT");
+    assert.strictEqual(claimQuery.params[1], "nova-staging");
+
+    const routedUpdate = findRoutedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id);
+    assert.ok(routedUpdate, "expected a routed status update");
+    assert.strictEqual(routedUpdate.params[1], "nova-staging");
   });
 });
 
@@ -285,7 +328,8 @@ describe("H01: broadcast message uses group chat type", () => {
     await processAgentChatMessage({
       message: { ...SAMPLE_MESSAGE, recipients: ["*"] },
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -324,7 +368,8 @@ describe("A01: deliver() never calls send_agent_message", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -360,7 +405,8 @@ describe("A02: empty turn output is suppressed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -396,7 +442,8 @@ describe("A03: NO_REPLY token is suppressed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -433,7 +480,8 @@ describe("A04: ANNOUNCE_SKIP token is suppressed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -470,7 +518,8 @@ describe("A05: fallback summary is suppressed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -500,7 +549,8 @@ describe("A12: origin route is closed (no deliverable agent_chat target)", () =>
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -544,7 +594,8 @@ describe("A12: origin route is closed (no deliverable agent_chat target)", () =>
     await injectBreakerAlert({
       alert,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       runtime,
@@ -602,7 +653,8 @@ describe("E01: successful dispatch marks routed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -632,7 +684,8 @@ describe("I01: muted peer suppresses wake", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -679,7 +732,8 @@ describe("I02: breaker alert injected into per-peer session", () => {
     await injectBreakerAlert({
       alert,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       runtime,
@@ -725,7 +779,8 @@ describe("I02: breaker alert injected into per-peer session", () => {
     await injectBreakerAlert({
       alert,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       runtime,
@@ -746,7 +801,7 @@ describe("B01: agent_chat_send factory opts out for sandboxed sessions", () => {
   it("returns null when toolContext.sandboxed is true", () => {
     const factory = createAgentChatTools({
       createClient: () => ({}) as import("pg").Client,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
     });
     assert.strictEqual(factory({ sandboxed: true }), null);
   });
@@ -756,7 +811,7 @@ describe("B02: agent_chat_send sends to a single peer", () => {
   it("calls send_agent_message with lowercased recipient and replyTo", async () => {
     const factory = createAgentChatTools({
       createClient: () => makeFakeClient({ sendReturns: 99 }) as unknown as import("pg").Client,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
     });
     const tools = factory({})!;
     const sendTool = tools.find((t) => t.name === "agent_chat_send")!;
@@ -779,7 +834,7 @@ describe("B03: agent_chat_send broadcasts with '*', returning suppressed on null
     };
     const factory = createAgentChatTools({
       createClient: () => fakeClient as unknown as import("pg").Client,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
     });
     const tools = factory({})!;
     const sendTool = tools.find((t) => t.name === "agent_chat_send")!;
@@ -799,7 +854,7 @@ describe("D01: agent_chat_mark returns applied and notApplied", () => {
     const factory = createAgentChatTools({
       createClient: () =>
         makeFakeClient({ markApplied: [BigInt(1), BigInt(3)] }) as unknown as import("pg").Client,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
     });
     const tools = factory({})!;
     const markTool = tools.find((t) => t.name === "agent_chat_mark")!;

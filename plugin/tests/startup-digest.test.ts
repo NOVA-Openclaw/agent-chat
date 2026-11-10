@@ -200,7 +200,8 @@ describe("TC-23-051: full mode registers and runs digest", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime: api.runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -228,7 +229,8 @@ describe("TC-23-052: start() fires exactly once when called twice", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -251,7 +253,8 @@ describe("TC-23-053: stop() resets guard so a second start() fires", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -294,12 +297,14 @@ describe("TC-23-055: duplicate hooks on hot reload fire digest once", () => {
 
     const serviceA = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
     const serviceB = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
 
@@ -321,7 +326,8 @@ describe("TC-23-056: empty backlog sends no digest", () => {
     const client = makeFakeClient({ unresolved: [], total: 0 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -345,7 +351,8 @@ describe("TC-23-057: cap boundary 19 — no remaining line", () => {
     const client = makeFakeClient({ unresolved: rows, total: 19 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -371,7 +378,8 @@ describe("TC-23-058: cap boundary 20 — remaining line omitted entirely", () =>
     const client = makeFakeClient({ unresolved: rows, total: 20 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -399,7 +407,8 @@ describe("TC-23-059: cap boundary 21 — 20 oldest + remaining line + paging que
     const client = makeFakeClient({ unresolved: rows, total: 21 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -432,7 +441,8 @@ describe("TC-23-060: overflow persistence / no starvation", () => {
 
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
 
@@ -465,7 +475,8 @@ describe("TC-23-062: grouped by sender with previews", () => {
     const client = makeFakeClient({ unresolved: rows, total: 4 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -494,7 +505,8 @@ describe("TC-23-063: instructions present", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)], total: 1 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 

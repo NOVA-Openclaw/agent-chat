@@ -200,7 +200,9 @@ describe("A11/TC-23-033 retired: deliver fired does not auto-send or mark respon
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -235,7 +237,9 @@ describe("A12/TC-23-034 retired: no reply leaves message routed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -272,7 +276,9 @@ describe("TC-23-035/036: deferred turn stays routed", () => {
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });
@@ -301,7 +307,9 @@ describe("A13/TC-23-037 retired: linked reply does not auto-mark responded", () 
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -329,7 +337,9 @@ describe("A10/TC-23-038 retired: no linked reply leaves message routed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -361,7 +371,9 @@ describe("TC-23-041: replay regression — already-responded rows are never re-d
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -409,14 +421,18 @@ describe("TC-23-112: only the claim winner dispatches", () => {
       processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       }),
       processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       }),
@@ -440,7 +456,9 @@ describe("TC-23-113: claimed-then-failed still marks failed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -468,7 +486,9 @@ describe("TC-23-115: no duplicate dispatch regardless of implementation mechanis
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });

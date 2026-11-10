@@ -170,7 +170,7 @@ _ensure_agent_chat_postgres_json() {
      | if (.agentChatDatabase // null) | type == "string" then . else .agentChatDatabase = $db end
      | if (.agent_chat // null) | type == "object" then
          .agent_chat |= . + {
-             database: (.database // $db),
+             database: (if $force_db then $db else (.database // $db) end),
              user: (.user // $user),
              password: (.password // $pass)
          }

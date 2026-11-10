@@ -107,12 +107,19 @@ Beyond the three install-model steps above, the OpenClaw channel plugin has
 one more requirement that is easy to miss because nothing fails until the
 first real message:
 
-- **The plugin resolves its own agent identity from the `agent_chat` DB
-  connection's user** (`postgres.json`'s `agent_chat.user`, or `PGUSER` if
-  that section is absent) — never from `cfg.agents.list`, never `"main"`. On
-  **OpenClaw 2026.9.x and later**, that resolved name **must also be a
-  configured gateway agent id** (keyed under `agents.entries` on these
-  builds). If it isn't, every reply dispatch and the startup digest fail with:
+- **The plugin keeps two identities separate:** the PostgreSQL role used for
+  the bus connection (`postgres.json`'s `agent_chat.user`, or `PGUSER`) and
+  the OpenClaw gateway agent id that owns dispatched sessions. The DB role is
+  used for `send_agent_message()` provenance and `agent_chat_processed` row
+  ownership. The gateway agent id is resolved from:
+
+  1. `channels.agent_chat.agentId` (explicit override).
+  2. The sole/default agent in `cfg.agents.entries` or `cfg.agents.list`.
+  3. Fallback to the DB role name for backward compatibility.
+
+  On **OpenClaw 2026.9.x and later**, the resolved gateway agent id **must
+  be a configured gateway agent id** (keyed under `agents.entries`). If it
+  isn't, every reply dispatch and the startup digest fail with:
 
   ```
   PreparedModelRuntimeOwnerNotPublishedError: prepared reply dispatch runtime owner was not published for <name>
@@ -123,13 +130,10 @@ first real message:
   and the startup digest (see below) never arrives either — both fail
   identically with the error above, logged generically as a dispatch failure
   (`markMessageFailed`) rather than a clear configuration error. **Fix:**
-  ensure the agent_chat DB role's name (`agent_chat.user` in `postgres.json`)
-  is identical to a gateway agent id already configured on that same OpenClaw
-  instance. This coupling does not exist on OpenClaw 2026.7.x (OLD build);
-  it is new behavior in the 2026.9.x prepared-model-runtime rework. Tracked
-  for a startup-time check in
-  [agent-chat#26](https://github.com/NOVA-Openclaw/agent-chat/issues/26) so
-  this fails loud at plugin start instead of opaquely on the first dispatch.
+  configure a sole/default gateway agent, or set `channels.agent_chat.agentId`
+  to an existing gateway agent id. This coupling does not exist on OpenClaw
+  2026.7.x (OLD build); it is new behavior in the 2026.9.x
+  prepared-model-runtime rework.
 
 ## Schema-sync listener
 
