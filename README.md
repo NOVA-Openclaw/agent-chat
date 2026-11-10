@@ -79,13 +79,13 @@ The bus follows a three-step install model:
    nor any sequence grants: `send_agent_message()` and the other bus functions
    are `SECURITY DEFINER` owned by `postgres` and allocate their own ids.
 
-   **Important:** `install.sh` / the SQL migrations only set up the bus schema,
-   seed the grant matrix, and lock down the circuit-breaker/control tables.
-   They do **not** grant an arbitrary connecting role the DML access it needs
-   to claim and route messages. If the OpenClaw gateway connects as a role
-   that is not already in the schema's standard-agent grant list (for example
-   a staging-only role like `nova-staging`), run `register-agent.sh` for that
-   role before starting the plugin. The control tables (`agent_chat_error_templates`,
+   **Important:** `install.sh` / the SQL migrations only set up the bus schema
+   and lock down the circuit-breaker/control tables. They do **not** grant an
+   arbitrary connecting role the DML access it needs to claim and route
+   messages, and they contain no grants to named agent roles. If the OpenClaw
+   gateway connects as a role that has not been registered, run
+   `register-agent.sh <role_name>` for that role before starting the plugin.
+   The control tables (`agent_chat_error_templates`,
    `agent_chat_breaker_config`, `agent_chat_breaker_state`, `agent_chat_breaker_alerts`,
    `agent_chat_mutes`, `agent_chat_suppressed_log`) are written only through
    `SECURITY DEFINER` functions, so callers do not need direct DML on them.
@@ -193,8 +193,8 @@ listener behavior, deployment, and safety machinery.
   `SELECT`/`INSERT`/`UPDATE` on `agent_chat_processed` from `register-agent.sh`.
   Direct DML on `agent_chat` is intentionally not granted: writes must go
   through `send_agent_message()` and the other `SECURITY DEFINER` functions.
-  Read-only roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is
-  intentionally denied `SELECT` on the bus tables.
+  `schema.sql` contains no grants to named agent roles; this keeps the repo
+  usable by any agent system (agent-chat#39).
 
 See [`docs/security-model.md`](docs/security-model.md) for the full mechanics
 (why `session_user` rather than `current_user`, the historical trigger-binding

@@ -302,14 +302,8 @@ EXCEPTION WHEN insufficient_privilege THEN
     RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
 END $$;
 
--- Preserve explicit EXECUTE grants for cross-ecosystem callers.
-GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
-
--- mark_agent_chat_status is intended for all agent roles; default PUBLIC
--- EXECUTE is left in place per the repo convention (schema.sql documents
--- required EXECUTE without revoking PUBLIC access). Explicit grants are
--- added for cross-ecosystem and special roles for clarity.
-GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants. Bus functions are SECURITY DEFINER
+-- owned by postgres and remain executable via PUBLIC default privileges.
 
 -- Version handshake.
 CREATE TABLE IF NOT EXISTS public.schema_version (

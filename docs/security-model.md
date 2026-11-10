@@ -165,35 +165,42 @@ full symptom and fix. This is a gateway-plugin coupling issue, not a database
 authorization gap; `mark_agent_chat_status()`'s own SQL-level authorization is
 unaffected and enforces correctly regardless of whether dispatch succeeds.
 
-## Grant matrix
+## Grant model: no access by agent name
 
-`schema.sql`'s privilege section is the authoritative grant list. Notable
-asymmetries, preserved verbatim from live production because they reflect
-deliberate access-control decisions, not oversights:
+`schema.sql` is intentionally portable and contains **no grants to named
+agent roles**. This is enforced by agent-chat#39: the repo never grants
+access to anyone by name, so it remains usable by any agent system.
 
-- **`newhart` is explicitly denied `SELECT`** on `agent_chat` and
-  `agent_chat_processed` (`REVOKE SELECT ... FROM newhart`), even though the
-  `nova` role's default privileges would otherwise grant it. This is a
-  standing decision, not a bug — do not "fix" it by removing the `REVOKE`.
-- **`cadence` and `recon` are read-only on `agent_chat`.** `recon` additionally
-  has full CRUD on `agent_chat_processed` (it tracks its own processing state
-  even though it cannot post messages).
-- **`nova-staging` gets `SELECT` on the bus tables plus explicit `EXECUTE`
-  grants on `send_agent_message()` and `mark_agent_chat_status()`** — it can
-  send, poll, and self-triage its own processed rows, but does not need
-  sequence-allocation privileges because it never inserts directly.
-- **`victoria` has full CRUD** on both tables plus view access — a
-  cross-ecosystem peer with the same access level as ecosystem subagents —
-  plus the same explicit `EXECUTE` grants on `send_agent_message()` and
-  `mark_agent_chat_status()` as `nova-staging` (redundant with PUBLIC EXECUTE
-  default, documented explicitly for clarity rather than as a narrower grant).
+Per-agent table access is applied only by `register-agent.sh`, which takes
+an arbitrary agent name argument and grants:
 
-If you are registering a new agent, use `register-agent.sh` rather than
-hand-writing grants — it applies the standard CRUD + sequence-usage set
-consistently and is idempotent. See
-[docs/adoption-guide.md](adoption-guide.md) for the full registration
-workflow and [README.md § Install model](../README.md#install-model) for the
-three-script flow.
+- `SELECT` on `public.agent_chat` — required for polling and reading
+  immutable messages.
+- `SELECT`, `INSERT`, `UPDATE` on `public.agent_chat_processed` — required
+  for the plugin to claim inbound messages and transition their processing
+  status.
+
+`register-agent.sh` intentionally does **not** grant:
+
+- Direct `INSERT`/`UPDATE`/`DELETE` on `public.agent_chat` — all writes must
+  go through `send_agent_message()`.
+- Any `EXECUTE` privilege on bus functions — those functions are `SECURITY
+  DEFINER` owned by `postgres` and remain executable via `PUBLIC` default
+  privileges.
+- Sequence `USAGE` — `send_agent_message()` allocates ids inside its
+  `SECURITY DEFINER` context.
+
+The schema itself only hardens the breaker/mute control tables: any role
+that already holds `SELECT` on `agent_chat` (or `EXECUTE` on
+`send_agent_message`, for legacy upgrades) receives `SELECT` only on the
+control tables, with `INSERT`/`UPDATE`/`DELETE` explicitly revoked. The list
+of affected roles is discovered at apply time from
+`information_schema.role_table_grants` / `information_schema.role_routine_grants`,
+so no agent name appears in the SQL.
+
+Migration `009-agent-chat-39-generic-grants.sql` performs the same dynamic
+re-application for existing databases, preserving working access for agents
+that were already registered without naming them.
 
 ## agent-chat#11: courtesy-reply-storm circuit breaker
 
@@ -216,15 +223,13 @@ constraint from [agent-chat#11](https://github.com/NOVA-Openclaw/agent-chat/issu
 The three new tables (`agent_chat_error_templates`, `agent_chat_breaker_state`,
 `agent_chat_suppressed_log`) extend the same write-lockdown invariant as
 `agent_chat` itself: `send_agent_message()` is `SECURITY DEFINER` owned by
-`postgres`, so it is the only writer. Because `schema.sql`'s `ALTER DEFAULT
-PRIVILEGES FOR ROLE postgres ... GRANT DELETE, INSERT, SELECT, UPDATE ON
-TABLES` clause applies automatically to *any* new table `postgres` creates,
-the schema and migration both explicitly `REVOKE INSERT, UPDATE, DELETE` from
-the standard agent role list on all three tables immediately after creation,
-leaving `SELECT` only. This was verified empirically against a live
-default-privileges database during development — it is not a hypothetical
-risk, and any future new table added to this schema needs the same explicit
-revoke or it inherits open write access silently.
+`postgres`, so it is the only writer. The schema dynamically discovers roles
+that already have bus access and `REVOKE`s `INSERT`, `UPDATE`, `DELETE` on
+the control tables from each of them, leaving `SELECT` only. Because the
+schema contains no named default-privileges grants, there is no ambient
+source of control-table DML privileges for new tables; any future new table
+added to this schema needs the same explicit revoke or it inherits open
+write access silently.
 
 ## Known open hardening items
 

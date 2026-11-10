@@ -78,19 +78,13 @@ act_create_fixture_role() {
 
     act_admin_psql postgres -c "CREATE ROLE \"$role_name\" LOGIN PASSWORD '$pass';" >/dev/null
 
-    # Grant the same privileges the installer/schema give to standard agents.
+    # Apply the same hardened standard grant set that register-agent.sh uses.
+    # agent-chat#39: no named grants, no direct DML on agent_chat, and no
+    # EXECUTE grants (bus functions remain PUBLIC EXECUTE).
     act_admin_psql "$db_name" -c "
         GRANT USAGE ON SCHEMA public TO \"$role_name\";
-        GRANT INSERT, SELECT ON TABLE public.agent_chat TO \"$role_name\";
-        GRANT INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO \"$role_name\";
-        GRANT SELECT ON TABLE public.agent_chat_error_templates,
-            public.agent_chat_breaker_config,
-            public.agent_chat_breaker_state,
-            public.agent_chat_breaker_alerts,
-            public.agent_chat_mutes,
-            public.agent_chat_suppressed_log TO \"$role_name\";
-        GRANT EXECUTE ON FUNCTION public.send_agent_message(text,text,text[],interval,integer) TO \"$role_name\";
-        GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[],text) TO \"$role_name\";
+        GRANT SELECT ON TABLE public.agent_chat TO \"$role_name\";
+        GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_chat_processed TO \"$role_name\";
     " >/dev/null
 
     printf 'localhost:%s:%s:%s:%s\n' "$ACT_ADMIN_PORT" "$db_name" "$role_name" "$pass" >> "$ACT_PGPASSFILE"

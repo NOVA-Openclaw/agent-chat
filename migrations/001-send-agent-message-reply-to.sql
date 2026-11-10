@@ -85,6 +85,5 @@ EXCEPTION WHEN insufficient_privilege THEN
     RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
 END $$;
 
--- Preserve the explicit EXECUTE grants that the checked-in schema file defines
--- for cross-ecosystem callers (victoria, nova-staging).
-GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants. Bus functions are SECURITY DEFINER
+-- owned by postgres and remain executable via PUBLIC default privileges.
