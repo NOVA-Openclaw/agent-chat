@@ -346,7 +346,7 @@ async function fetchUnprocessedMessages(client: pg.Client, agentName: string) {
  * concurrent worker, a prior partial run, or any terminal status) causes the
  * caller to skip dispatch.
  */
-async function claimMessage(
+export async function claimMessage(
   client: pg.Client,
   chatId: number,
   agentName: string,

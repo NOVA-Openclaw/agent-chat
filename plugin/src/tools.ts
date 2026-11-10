@@ -21,7 +21,7 @@ export interface AgentChatToolContext {
 
 const MAX_MESSAGE_BYTES = 64 * 1024;
 
-const SendParams = Type.Object(
+export const SendParams = Type.Object(
   {
     to: Type.Union([Type.String({ minLength: 1 }), Type.Literal("*")]),
     text: Type.String({ minLength: 1, maxLength: 65535 }),
@@ -32,7 +32,7 @@ const SendParams = Type.Object(
   { additionalProperties: false },
 );
 
-const MarkParams = Type.Object(
+export const MarkParams = Type.Object(
   {
     ids: Type.Array(Type.Integer({ minimum: 1, maximum: 2147483647 }), {
       minItems: 1,
@@ -43,7 +43,7 @@ const MarkParams = Type.Object(
   { additionalProperties: false },
 );
 
-const MuteParams = Type.Object(
+export const MuteParams = Type.Object(
   {
     peer: Type.String({ minLength: 1 }),
     minutes: Type.Optional(Type.Integer({ minimum: 1 })),
