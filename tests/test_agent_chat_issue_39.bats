@@ -411,6 +411,155 @@ teardown() {
     [ "$status" -eq 0 ]
 }
 
+# ─── R2-11: fresh install succeeds when existing bus users need quoting ─────
+# Regression for SE #1453 Fix Loop 8: schema.sql's dynamic grant discovery
+# used grantee::regrole::text + format('%I'), which double-quoted identifiers
+# containing hyphens (e.g. nova-staging). The DB already existed and had a
+# hyphenated role when Graybeard's staging install failed at schema.sql:1114.
+
+_assert_least_privilege() {
+    local db_name="$1"
+    local role="$2"
+
+    # agent_chat: SELECT only.
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat', 'SELECT');"
+    [ "$output" = "t" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat', 'INSERT');"
+    [ "$output" = "f" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat', 'UPDATE');"
+    [ "$output" = "f" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat', 'DELETE');"
+    [ "$output" = "f" ]
+
+    # agent_chat_processed: SELECT + INSERT + UPDATE, no DELETE.
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat_processed', 'SELECT');"
+    [ "$output" = "t" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat_processed', 'INSERT');"
+    [ "$output" = "t" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat_processed', 'UPDATE');"
+    [ "$output" = "t" ]
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.agent_chat_processed', 'DELETE');"
+    [ "$output" = "f" ]
+
+    # Control tables: SELECT only.
+    local table
+    for table in agent_chat_error_templates agent_chat_breaker_config \
+                 agent_chat_breaker_state agent_chat_breaker_alerts \
+                 agent_chat_mutes agent_chat_suppressed_log; do
+        run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.$table', 'SELECT');"
+        [ "$output" = "t" ]
+        run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.$table', 'INSERT');"
+        [ "$output" = "f" ]
+        run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.$table', 'UPDATE');"
+        [ "$output" = "f" ]
+        run _ephemeral_super_psql -d "$db_name" -At -c "SELECT has_table_privilege('$role', 'public.$table', 'DELETE');"
+        [ "$output" = "f" ]
+    done
+}
+
+@test "R2-11: install.sh succeeds on a DB that already has hyphenated and mixed-case bus users" {
+    _ephemeral_start
+
+    local db_name role_hyphen role_mixed pass
+    db_name="agent_chat_existing_quotes_$$"
+    pass="$(act_random_password)"
+    # Hyphen forces identifier quoting; mixed-case forces case preservation.
+    role_hyphen="act_$(act_random_suffix)-test-role"
+    role_mixed="Act_$(act_random_suffix)-MixedCase"
+
+    _ephemeral_super_psql -d postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
+
+    # Create the schema objects so the roles have something to be granted on.
+    _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/schema.sql" >/dev/null
+    local f
+    for f in "$REPO_ROOT"/migrations/*.sql; do
+        _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$f" >/dev/null
+    done
+
+    # Simulate existing bus users that pre-date this install run.
+    _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -c "
+        CREATE ROLE \"$role_hyphen\" LOGIN PASSWORD '$pass';
+        CREATE ROLE \"$role_mixed\" LOGIN PASSWORD '$pass';
+        GRANT USAGE ON SCHEMA public TO \"$role_hyphen\", \"$role_mixed\";
+        GRANT SELECT ON TABLE public.agent_chat TO \"$role_hyphen\", \"$role_mixed\";
+        GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_chat_processed TO \"$role_hyphen\", \"$role_mixed\";
+        GRANT EXECUTE ON FUNCTION public.send_agent_message(text,text,text[],interval,integer) TO \"$role_hyphen\", \"$role_mixed\";
+    " >/dev/null
+
+    # Reset schema_version to simulate the pre-existing DB being behind and
+    # requiring a re-sync (Graybeard's scenario: DB existed, schema_version 8).
+    _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -c "
+        DELETE FROM public.schema_version WHERE version = 9;
+    " >/dev/null
+
+    # Re-run installer as postgres; it must discover the existing quoted roles,
+    # re-apply the hardened grant set, and reach schema_version 9.
+    AGENT_CHAT_DB_NAME="$db_name" PGUSER=postgres run "$INSTALLER"
+    echo "$output" >&2
+    [ "$status" -eq 0 ]
+
+    # Schema version handshake reached 9.
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT MAX(version) FROM public.schema_version;"
+    [ "$output" = "9" ]
+
+    # Both pre-existing roles retain least-privilege bus access.
+    _assert_least_privilege "$db_name" "$role_hyphen"
+    _assert_least_privilege "$db_name" "$role_mixed"
+}
+
+# ─── R2-12: migration 009 succeeds when existing bus users need quoting ─────
+
+@test "R2-12: migration 009 preserves hyphenated and mixed-case pre-existing agents" {
+    _ephemeral_start
+
+    local db_name role_hyphen role_mixed pass
+    db_name="agent_chat_mig009_quotes_$$"
+    pass="$(act_random_password)"
+    role_hyphen="act_$(act_random_suffix)-legacy"
+    role_mixed="Act_$(act_random_suffix)-LegacyMixed"
+
+    _ephemeral_super_psql -d postgres -c "CREATE DATABASE \"$db_name\";" >/dev/null
+
+    # Apply schema.sql and migrations 001-008 to reach version 8 state.
+    _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/schema.sql" >/dev/null
+    local f
+    for f in $(find "$REPO_ROOT"/migrations -maxdepth 1 -name '[0-9][0-9][0-9]-*.sql' | sort); do
+        local num
+        num="$(basename "$f" | sed -E 's/^([0-9]+).*/\1/')"
+        if [ "$num" -le 8 ]; then
+            _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$f" >/dev/null
+        fi
+    done
+
+    # Create legacy roles needing identifier quoting and grant old-style access.
+    _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -c "
+        CREATE ROLE \"$role_hyphen\" LOGIN PASSWORD '$pass';
+        CREATE ROLE \"$role_mixed\" LOGIN PASSWORD '$pass';
+        GRANT USAGE ON SCHEMA public TO \"$role_hyphen\", \"$role_mixed\";
+        GRANT SELECT ON TABLE public.agent_chat TO \"$role_hyphen\", \"$role_mixed\";
+        GRANT EXECUTE ON FUNCTION public.send_agent_message(text,text,text[],interval,integer) TO \"$role_hyphen\", \"$role_mixed\";
+    " >/dev/null
+
+    # Apply migration 009; this is where the double-quote bug bit.
+    run _ephemeral_super_psql -d "$db_name" -v ON_ERROR_STOP=1 -f "$REPO_ROOT/migrations/009-agent-chat-39-generic-grants.sql"
+    echo "$output" >&2
+    [ "$status" -eq 0 ]
+
+    # Version handshake reached 9.
+    run _ephemeral_super_psql -d "$db_name" -At -c "SELECT MAX(version) FROM public.schema_version;"
+    [ "$output" = "9" ]
+
+    # Both legacy roles retain least-privilege bus access and can still send.
+    _assert_least_privilege "$db_name" "$role_hyphen"
+    _assert_least_privilege "$db_name" "$role_mixed"
+
+    printf '127.0.0.1:%s:%s:%s:%s\n' "$EP_PORT" "$db_name" "$role_hyphen" "$pass" >> "$EP_PGPASS"
+    run psql -h "$EP_HOST" -p "$EP_PORT" -U "$role_hyphen" -d "$db_name" -At -c \
+        "SELECT send_agent_message('$role_hyphen', 'still works', ARRAY['$role_mixed']);"
+    [ "$status" -eq 0 ]
+    [ -n "$output" ]
+}
+
 # ─── J06-J07: back-compat for naive pre-fix callers ────────────────────────
 
 @test "J06: send_agent_message 3-arg call works and sets reply_to/expires_at NULL" {
