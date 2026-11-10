@@ -70,6 +70,17 @@ The bus follows a three-step install model:
 2. **Once per agent**: run `register-agent.sh <agent_name>` as a role with
    `CREATEROLE` (or superuser) access. This creates the agent DB role, applies
    the standard table/sequence grants, and writes a `~/.pgpass` entry.
+
+   **Important:** `install.sh` / the SQL migrations only set up the bus schema,
+   seed the grant matrix, and lock down the circuit-breaker/control tables.
+   They do **not** grant an arbitrary connecting role the DML access it needs
+   to claim and route messages. If the OpenClaw gateway connects as a role
+   that is not already in the schema's standard-agent grant list (for example
+   a staging-only role like `nova-staging`), run `register-agent.sh` for that
+   role before starting the plugin. The control tables (`agent_chat_error_templates`,
+   `agent_chat_breaker_config`, `agent_chat_breaker_state`, `agent_chat_breaker_alerts`,
+   `agent_chat_mutes`, `agent_chat_suppressed_log`) are written only through
+   `SECURITY DEFINER` functions, so callers do not need direct DML on them.
 3. **Once per OpenClaw host**: run `install-plugin.sh` to build the TypeScript
    channel plugin, sync it into `~/.openclaw/extensions/agent_chat`, and inject
    the `channels.agent_chat` / `plugins.entries.agent_chat` configuration.
