@@ -8,11 +8,13 @@
 #   --check                 Report registration state without making changes.
 #   --help                  Show this help message.
 #
-# Idempotent. On every run (except --check) the script re-applies the standard
-# grant set: SELECT/INSERT/UPDATE/DELETE on agent_chat and agent_chat_processed,
-# and USAGE on agent_chat_id_seq. This is deliberate policy; if you have
-# manually hardened an agent's bus permissions, do not re-run this script for that
-# agent unless you intend to restore the standard grant set.
+# Idempotent. On every run (except --check) the script re-applies the hardened
+# standard grant set: SELECT on agent_chat (messages are immutable; writes go
+# through send_agent_message()), and SELECT/INSERT/UPDATE on agent_chat_processed
+# (the plugin's own per-agent processing state). No direct DML is granted on
+# agent_chat, and no sequence or function grants are needed: send_agent_message(),
+# mark_agent_chat_status(), and the breaker/mute helpers are SECURITY DEFINER
+# owned by postgres and remain executable via PUBLIC default privileges.
 
 set -euo pipefail
 
@@ -64,9 +66,7 @@ Environment:
 Notes:
   * Re-running for an already-registered agent is idempotent: grants are
     re-asserted and the .pgpass entry is replaced (never duplicated).
-  * This script always applies the standard grant set. If you have manually
-    restricted an agent's bus permissions, re-running will widen them back
-    to the standard set unless you avoid this script for that agent.
+  * This script applies the hardened standard grant set. Direct INSERT/UPDATE/DELETE on public.agent_chat is intentionally NOT granted; agents must use the SECURITY DEFINER send_agent_message() function.
 EOF
 }
 
@@ -273,11 +273,23 @@ main() {
   psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "ALTER ROLE \"$AGENT_NAME\" WITH PASSWORD '$PASSWORD';" >/dev/null
   echo -e "  ${CHECK_MARK} Set password for role '${AGENT_NAME}'"
 
-  # Apply standard grants.
-  psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_chat TO \"$AGENT_NAME\";" >/dev/null
-  psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.agent_chat_processed TO \"$AGENT_NAME\";" >/dev/null
-  psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO \"$AGENT_NAME\";" >/dev/null
-  echo -e "  ${CHECK_MARK} Applied standard grants to '${AGENT_NAME}'"
+  # Apply hardened standard grants. Reasons:
+  #   * agent_chat SELECT: the plugin polls and reads immutable messages.
+  #   * agent_chat_processed SELECT/INSERT/UPDATE: the plugin claims inbound
+  #     messages (INSERT) and transitions their status (UPDATE); SELECT supports
+  #     diagnostics and the fetchUnprocessedMessages query.
+  #   * No agent_chat DML: send_agent_message() is SECURITY DEFINER owned by
+  #     postgres and is the only authorized write path (enforced by
+  #     trg_enforce_agent_chat_function_use).
+  #   * No sequence grant: the plugin never allocates agent_chat_id_seq directly;
+  #     send_agent_message() allocates ids inside its SECURITY DEFINER context.
+  #   * No function grant: send_agent_message(), mark_agent_chat_status(), and
+  #     the breaker/mute helpers are executable by PUBLIC by default in this
+  #     schema; the registering role cannot grant EXECUTE on objects it does not
+  #     own, and the hardened model does not require widening that.
+  psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT ON TABLE public.agent_chat TO \"$AGENT_NAME\";" >/dev/null
+  psql -d "$DB_NAME" -v ON_ERROR_STOP=1 -c "GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_chat_processed TO \"$AGENT_NAME\";" >/dev/null
+  echo -e "  ${CHECK_MARK} Applied hardened standard grants to '${AGENT_NAME}'"
 
   # Update .pgpass.
   local host="${PGHOST:-localhost}"
