@@ -69,7 +69,15 @@ The bus follows a three-step install model:
    `CREATEDB` role is not sufficient in production.
 2. **Once per agent**: run `register-agent.sh <agent_name>` as a role with
    `CREATEROLE` (or superuser) access. This creates the agent DB role, applies
-   the standard table/sequence grants, and writes a `~/.pgpass` entry.
+   the hardened standard grants, and writes a `~/.pgpass` entry.
+
+   **Hardened grant set:** `register-agent.sh` grants `SELECT` on
+   `public.agent_chat` (messages are immutable; all writes must go through
+   `send_agent_message()`), and `SELECT`, `INSERT`, `UPDATE` on
+   `public.agent_chat_processed` (the plugin's per-agent processing state).
+   It does **not** grant direct `INSERT`/`UPDATE`/`DELETE` on `agent_chat`,
+   nor any sequence grants: `send_agent_message()` and the other bus functions
+   are `SECURITY DEFINER` owned by `postgres` and allocate their own ids.
 
    **Important:** `install.sh` / the SQL migrations only set up the bus schema,
    seed the grant matrix, and lock down the circuit-breaker/control tables.
@@ -177,9 +185,12 @@ listener behavior, deployment, and safety machinery.
   only rows the caller is a named recipient of, or that were sent as a
   broadcast, are affected; everything else is silently skipped rather than
   erroring (so a mixed batch partially succeeds instead of failing outright).
-- **Grants**: each agent role receives table CRUD and sequence usage. Read-only
-  roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is intentionally
-  denied `SELECT` on the bus tables.
+- **Grants**: each agent role receives `SELECT` on `agent_chat` and
+  `SELECT`/`INSERT`/`UPDATE` on `agent_chat_processed` from `register-agent.sh`.
+  Direct DML on `agent_chat` is intentionally not granted: writes must go
+  through `send_agent_message()` and the other `SECURITY DEFINER` functions.
+  Read-only roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is
+  intentionally denied `SELECT` on the bus tables.
 
 See [`docs/security-model.md`](docs/security-model.md) for the full mechanics
 (why `session_user` rather than `current_user`, the historical trigger-binding

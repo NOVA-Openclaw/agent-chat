@@ -1131,10 +1131,11 @@ _tc11x_send_as_b() {
     [ "$status" -ne 0 ]
 }
 
-@test "TC-13: grant always-standard policy is documented in --help" {
+@test "TC-13: hardened grant policy is documented in --help" {
     run env PGUSER=agentchat_test "$REGISTER" --help
     [ "$status" -eq 0 ]
-    [[ "$output" == *"always applies the standard grant set"* ]]
+    [[ "$output" == *"hardened standard grant set"* ]]
+    [[ "$output" == *"Direct INSERT/UPDATE/DELETE on public.agent_chat"* ]]
 }
 
 @test "register-agent: --check reports missing role" {
@@ -1164,7 +1165,7 @@ _tc11x_send_as_b() {
     act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$limited_role\";" >/dev/null 2>&1 || true
 }
 
-@test "TC-14: register-agent.sh applies the standard grant set the plugin needs" {
+@test "TC-14: register-agent.sh applies the hardened grant set the plugin needs" {
     run env PGUSER=agentchat_test "$INSTALLER"
     [ "$status" -eq 0 ]
 
@@ -1179,13 +1180,36 @@ _tc11x_send_as_b() {
     AGENT_CHAT_DB_NAME="$AGENT_CHAT_DB_NAME" run env PGUSER=agentchat_test "$REGISTER" --password "$fixture_pass" "$fixture_role"
     [ "$status" -eq 0 ]
 
-    # The plugin needs to claim and update processed rows as this role.
+    # agent_chat is immutable for agents: SELECT is needed to poll, but direct
+    # INSERT/UPDATE/DELETE must be denied (writes go through send_agent_message()).
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat', 'SELECT');"
+    [ "$output" = "t" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat', 'INSERT');"
+    [ "$output" = "f" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat', 'UPDATE');"
+    [ "$output" = "f" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat', 'DELETE');"
+    [ "$output" = "f" ]
+
+    # agent_chat_processed is the plugin's own per-agent state table.
+    # It needs SELECT for diagnostics/polling, INSERT to claim messages, and
+    # UPDATE to transition status. DELETE is not required.
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'SELECT');"
+    [ "$output" = "t" ]
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'INSERT');"
     [ "$output" = "t" ]
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'UPDATE');"
     [ "$output" = "t" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'DELETE');"
+    [ "$output" = "f" ]
+
+    # The plugin does not allocate agent_chat_id_seq directly; send_agent_message()
+    # allocates ids inside its SECURITY DEFINER context.
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_sequence_privilege('$fixture_role', 'public.agent_chat_id_seq', 'USAGE');"
+    [ "$output" = "f" ]
 
     # The plugin needs to call the public functions it exposes as tools.
+    # They remain executable via PUBLIC default privileges in this schema.
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_function_privilege('$fixture_role', 'public.send_agent_message(text,text,text[],interval,integer)', 'EXECUTE');"
     [ "$output" = "t" ]
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_function_privilege('$fixture_role', 'public.mark_agent_chat_status(bigint[],text)', 'EXECUTE');"
