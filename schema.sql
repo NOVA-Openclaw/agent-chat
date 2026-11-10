@@ -1079,14 +1079,17 @@ DECLARE
     ];
 BEGIN
     FOR v_role IN
-        SELECT DISTINCT grantee::regrole::text
+        -- Use grantee (sql_identifier text) directly; %I quotes once below.
+        -- grantee::regrole::text would already quote identifiers and must not
+        -- be passed to %I, or names like "nova-staging" get double-quoted.
+        SELECT DISTINCT grantee
         FROM information_schema.role_table_grants
         WHERE table_schema = 'public'
           AND table_name = 'agent_chat'
           AND privilege_type = 'SELECT'
           AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
         UNION
-        SELECT DISTINCT grantee::regrole::text
+        SELECT DISTINCT grantee
         FROM information_schema.role_routine_grants
         WHERE routine_schema = 'public'
           AND routine_name = 'send_agent_message'
