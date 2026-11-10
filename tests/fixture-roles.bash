@@ -85,6 +85,15 @@ act_create_fixture_role() {
         GRANT USAGE ON SCHEMA public TO \"$role_name\";
         GRANT SELECT ON TABLE public.agent_chat TO \"$role_name\";
         GRANT SELECT, INSERT, UPDATE ON TABLE public.agent_chat_processed TO \"$role_name\";
+        -- Test fixture diagnostic read access to breaker/mute control tables.
+        -- Production agents do not need this; register-agent.sh intentionally
+        -- omits it. This is test-only and uses the generic role variable.
+        GRANT SELECT ON TABLE public.agent_chat_error_templates,
+            public.agent_chat_breaker_config,
+            public.agent_chat_breaker_state,
+            public.agent_chat_breaker_alerts,
+            public.agent_chat_mutes,
+            public.agent_chat_suppressed_log TO \"$role_name\";
     " >/dev/null
 
     printf 'localhost:%s:%s:%s:%s\n' "$ACT_ADMIN_PORT" "$db_name" "$role_name" "$pass" >> "$ACT_PGPASSFILE"
