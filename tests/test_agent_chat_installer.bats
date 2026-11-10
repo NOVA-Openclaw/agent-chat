@@ -1013,10 +1013,12 @@ _tc11x_send_as_b() {
     [[ "$output" == *"Applied 004"* ]]
     [[ "$output" == *"Applied 005"* ]]
     [[ "$output" == *"Applied 007"* ]]
+    [[ "$output" == *"Applied 008"* ]]
+    [[ "$output" == *"Applied 009"* ]]
 
     # Verify schema_version.
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT MAX(version) FROM public.schema_version;"
-    [ "$output" = "8" ]
+    [ "$output" = "9" ]
 
     # Verify core objects.
     run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT proname FROM pg_proc WHERE proname = 'send_agent_message';"
