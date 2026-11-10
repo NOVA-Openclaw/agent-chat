@@ -41,6 +41,9 @@ Options:
 
 Environment:
   AGENT_CHAT_DB_NAME      Target database name (default: agent_chat).
+  AGENT_CHAT_AGENT_ID     Optional OpenClaw gateway agent id that owns
+                          agent_chat sessions. When set, written to
+                          channels.agent_chat.agentId in openclaw.json.
 EOF
 }
 
@@ -205,8 +208,16 @@ _ensure_openclaw_config() {
 
   # channels.agent_chat: strip dead connection keys. The plugin manifest's
   # channelConfigs schema rejects additionalProperties, so we do NOT write
-  # legacy keys like "enabled" or "routeToSession".
-  new_json=$(jq '.channels.agent_chat |= ((. // {}) | del(.database, .host, .port, .user, .password, .enabled))' "$config") || return 1
+  # legacy keys like "enabled" or "routeToSession". Preserve or inject
+  # agentId when AGENT_CHAT_AGENT_ID is set so clean installs can dispatch
+  # under a gateway agent id that differs from the DB role.
+  local agent_id_json="null"
+  if [ -n "${AGENT_CHAT_AGENT_ID:-}" ]; then
+    agent_id_json=$(jq -n --arg v "$AGENT_CHAT_AGENT_ID" '$v')
+  fi
+  new_json=$(jq --argjson agent_id "$agent_id_json" \
+    '.channels.agent_chat |= ((. // {}) | del(.database, .host, .port, .user, .password, .enabled) | if $agent_id != null then .agentId = $agent_id else . end)' \
+    "$config") || return 1
   # plugins.entries.agent_chat: enabled + database only, strip dead keys.
   new_json=$(jq '.plugins.entries.agent_chat |= (. + {"enabled": true} | .config |= ((. // {}) | del(.database, .host, .port, .user, .password, .routeToSession)))' <<< "$new_json") || return 1
 

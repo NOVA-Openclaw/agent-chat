@@ -71,6 +71,38 @@ describe("TC-23-022: differential check against NEW-build diagnostic logic", () 
   });
 });
 
+describe("TC-23-023: agentId is declared and validates", () => {
+  it("declares agentId in channelConfigs.agent_chat.schema.properties", () => {
+    const manifest = loadManifest();
+    const props = (manifest.channelConfigs?.agent_chat as Record<string, unknown>)?.schema as
+      Record<string, unknown> | undefined;
+    assert.ok(props);
+    const properties = props.properties as Record<string, unknown> | undefined;
+    assert.ok(properties);
+    assert.ok("agentId" in properties);
+    assert.strictEqual((properties.agentId as Record<string, unknown>).type, "string");
+  });
+
+  it("declares agentId in configSchema.properties", () => {
+    const manifest = loadManifest();
+    const props = manifest.configSchema?.properties as Record<string, unknown> | undefined;
+    assert.ok(props);
+    assert.ok("agentId" in props);
+    assert.strictEqual((props.agentId as Record<string, unknown>).type, "string");
+  });
+
+  it("a config containing agentId would be accepted by the manifest schema", () => {
+    const manifest = loadManifest();
+    const channelSchema = (manifest.channelConfigs?.agent_chat as Record<string, unknown>)?.schema as
+      { additionalProperties?: boolean; properties?: Record<string, unknown> } | undefined;
+    assert.ok(channelSchema);
+    assert.strictEqual(channelSchema.additionalProperties, false);
+    const allowed = new Set(Object.keys(channelSchema.properties ?? {}));
+    const config = { agentId: "main", pollIntervalMs: 1000 };
+    assert.ok(Object.keys(config).every((k) => allowed.has(k)));
+  });
+});
+
 describe("TC-23-025: malformed channelConfigs shapes", () => {
   it("string channelConfigs still suppresses the diagnostic (Object.hasOwn passes)", () => {
     const manifest: PluginManifest = {

@@ -1289,6 +1289,62 @@ EOF
     [ "$output" -eq 0 ]
 }
 
+@test "TC-60: install-plugin.sh writes channels.agent_chat.agentId from AGENT_CHAT_AGENT_ID" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    echo '{}' > "$oc_dir/openclaw.json"
+
+    AGENT_CHAT_DB_NAME="agent_chat" AGENT_CHAT_AGENT_ID="main" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -r '.channels.agent_chat.agentId' "$oc_dir/openclaw.json")" = "main" ]
+}
+
+@test "TC-60: install-plugin.sh overwrites stale agentId when AGENT_CHAT_AGENT_ID is set" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    cat > "$oc_dir/openclaw.json" <<'EOF'
+{
+  "channels": {
+    "agent_chat": {
+      "agentId": "old-agent",
+      "pollIntervalMs": 500
+    }
+  }
+}
+EOF
+
+    AGENT_CHAT_DB_NAME="agent_chat" AGENT_CHAT_AGENT_ID="main" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -r '.channels.agent_chat.agentId' "$oc_dir/openclaw.json")" = "main" ]
+    [ "$(jq -r '.channels.agent_chat.pollIntervalMs' "$oc_dir/openclaw.json")" = "500" ]
+}
+
+@test "TC-60: install-plugin.sh preserves existing agentId when AGENT_CHAT_AGENT_ID is unset" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    cat > "$oc_dir/openclaw.json" <<'EOF'
+{
+  "channels": {
+    "agent_chat": {
+      "agentId": "preserved-agent",
+      "pollIntervalMs": 500
+    }
+  }
+}
+EOF
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    [ "$(jq -r '.channels.agent_chat.agentId' "$oc_dir/openclaw.json")" = "preserved-agent" ]
+    [ "$(jq -r '.channels.agent_chat.pollIntervalMs' "$oc_dir/openclaw.json")" = "500" ]
+}
+
 @test "TC-60: install-plugin.sh honors AGENT_CHAT_DB_NAME in postgres.json" {
     local oc_dir="$FAKE_HOME/.openclaw"
     mkdir -p "$oc_dir"
