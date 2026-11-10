@@ -347,7 +347,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 -- ─── Update mark_agent_chat_status(): add 'skipped' and return applied ids ──
 DROP FUNCTION IF EXISTS public.mark_agent_chat_status(bigint[], text);
@@ -422,7 +422,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 -- ─── New alert read/mark functions ─────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.agent_chat_pending_alerts(p_agent text)
@@ -459,7 +459,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_pending_alerts(text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 CREATE OR REPLACE FUNCTION public.agent_chat_mark_alerts_seen(p_alert_ids integer[])
 RETURNS integer
@@ -489,7 +489,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_mark_alerts_seen(integer[]) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 -- ─── Mute functions ────────────────────────────────────────────────────────
 CREATE OR REPLACE FUNCTION public.agent_chat_mute_peer(
@@ -558,7 +558,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_mute_peer(text, integer, text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 CREATE OR REPLACE FUNCTION public.agent_chat_unmute_peer(p_peer text)
 RETURNS boolean
@@ -598,7 +598,7 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_unmute_peer(text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 CREATE OR REPLACE FUNCTION public.agent_chat_is_muted(p_agent text, p_peer text)
 RETURNS boolean
@@ -627,48 +627,55 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_is_muted(text, text) TO victoria, "nova-staging";
+-- agent-chat#39: no named EXECUTE grants; PUBLIC EXECUTE remains in effect.
 
 -- ─── Lock down direct writes on new breaker control tables ─────────────────
+-- agent-chat#39: discover roles that already have bus access instead of
+-- hardcoding a roster.
 DO $$
 DECLARE
-    v_roles CONSTANT text[] := ARRAY[
-        'argus','athena','coder','conductor','erato','flint','gem','gidget',
-        'graybeard','hermes','iris','marcie','nova','quill','scout','scribe',
-        'ticker','victoria'
-    ];
     v_role text;
     v_table text;
 BEGIN
-    FOREACH v_table IN ARRAY ARRAY[
-        'agent_chat_error_templates',
-        'agent_chat_breaker_config',
-        'agent_chat_breaker_state',
-        'agent_chat_breaker_alerts',
-        'agent_chat_mutes',
-        'agent_chat_suppressed_log'
-    ]
+    FOR v_role IN
+        SELECT DISTINCT grantee::regrole::text
+        FROM information_schema.role_table_grants
+        WHERE table_schema = 'public'
+          AND table_name = 'agent_chat'
+          AND privilege_type = 'SELECT'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
+        UNION
+        SELECT DISTINCT grantee::regrole::text
+        FROM information_schema.role_routine_grants
+        WHERE routine_schema = 'public'
+          AND routine_name = 'send_agent_message'
+          AND privilege_type = 'EXECUTE'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
     LOOP
-        FOREACH v_role IN ARRAY v_roles
+        -- Never revoke from the table owner: migrations may INSERT into
+        -- these control tables and must keep the owner's privileges in
+        -- non-superuser dev/test environments. In production the owner is
+        -- postgres, which is not discovered by the query above.
+        IF v_role = session_user OR v_role = 'postgres' THEN
+            CONTINUE;
+        END IF;
+        FOREACH v_table IN ARRAY ARRAY[
+            'agent_chat_error_templates',
+            'agent_chat_breaker_config',
+            'agent_chat_breaker_state',
+            'agent_chat_breaker_alerts',
+            'agent_chat_mutes',
+            'agent_chat_suppressed_log'
+        ]
         LOOP
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-                -- Never revoke from the table owner: migrations may INSERT into
-                -- these control tables and must keep the owner's privileges in
-                -- non-superuser dev/test environments. In production the owner
-                -- is postgres, which is not in v_roles, so this guard has no
-                -- security effect.
-                IF v_role = session_user THEN
-                    CONTINUE;
-                END IF;
-                EXECUTE format(
-                    'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
-                    v_table, v_role
-                );
-                EXECUTE format(
-                    'GRANT SELECT ON TABLE public.%I TO %I',
-                    v_table, v_role
-                );
-            END IF;
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
+                v_table, v_role
+            );
+            EXECUTE format(
+                'GRANT SELECT ON TABLE public.%I TO %I',
+                v_table, v_role
+            );
         END LOOP;
     END LOOP;
 END $$;
@@ -684,19 +691,7 @@ INSERT INTO public.schema_version (version, description)
 VALUES (8, 'agent-chat#34/#36: alert-only pair breaker, skipped status + applied ids, agent mute, fallback template')
 ON CONFLICT (version) DO NOTHING;
 
--- ─── Nova default privileges (non-superuser dev/test compatibility) ─────────
--- Wrapped so a non-superuser dev/test apply can still succeed; mirrors the
--- schema.sql bootstrap path and keeps upgraded databases identical to fresh
--- installs.
-DO $$
-BEGIN
-    ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
-EXCEPTION WHEN insufficient_privilege THEN
-    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
-        RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
-    ELSE
-        RAISE;
-    END IF;
-END $$;
+-- agent-chat#39: no named default privileges. Per-agent grants are applied
+-- by register-agent.sh; bus functions remain executable via PUBLIC.
 
 COMMIT;

@@ -79,13 +79,13 @@ The bus follows a three-step install model:
    nor any sequence grants: `send_agent_message()` and the other bus functions
    are `SECURITY DEFINER` owned by `postgres` and allocate their own ids.
 
-   **Important:** `install.sh` / the SQL migrations only set up the bus schema,
-   seed the grant matrix, and lock down the circuit-breaker/control tables.
-   They do **not** grant an arbitrary connecting role the DML access it needs
-   to claim and route messages. If the OpenClaw gateway connects as a role
-   that is not already in the schema's standard-agent grant list (for example
-   a staging-only role like `nova-staging`), run `register-agent.sh` for that
-   role before starting the plugin. The control tables (`agent_chat_error_templates`,
+   **Important:** `install.sh` / the SQL migrations only set up the bus schema
+   and lock down the circuit-breaker/control tables. They do **not** grant an
+   arbitrary connecting role the DML access it needs to claim and route
+   messages, and they contain no grants to named agent roles. If the OpenClaw
+   gateway connects as a role that has not been registered, run
+   `register-agent.sh <role_name>` for that role before starting the plugin.
+   The control tables (`agent_chat_error_templates`,
    `agent_chat_breaker_config`, `agent_chat_breaker_state`, `agent_chat_breaker_alerts`,
    `agent_chat_mutes`, `agent_chat_suppressed_log`) are written only through
    `SECURITY DEFINER` functions, so callers do not need direct DML on them.
@@ -126,12 +126,19 @@ Beyond the three install-model steps above, the OpenClaw channel plugin has
 one more requirement that is easy to miss because nothing fails until the
 first real message:
 
-- **The plugin resolves its own agent identity from the `agent_chat` DB
-  connection's user** (`postgres.json`'s `agent_chat.user`, or `PGUSER` if
-  that section is absent) — never from `cfg.agents.list`, never `"main"`. On
-  **OpenClaw 2026.9.x and later**, that resolved name **must also be a
-  configured gateway agent id** (keyed under `agents.entries` on these
-  builds). If it isn't, every reply dispatch and the startup digest fail with:
+- **The plugin keeps two identities separate:** the PostgreSQL role used for
+  the bus connection (`postgres.json`'s `agent_chat.user`, or `PGUSER`) and
+  the OpenClaw gateway agent id that owns dispatched sessions. The DB role is
+  used for `send_agent_message()` provenance and `agent_chat_processed` row
+  ownership. The gateway agent id is resolved from:
+
+  1. `channels.agent_chat.agentId` (explicit override).
+  2. The sole/default agent in `cfg.agents.entries` or `cfg.agents.list`.
+  3. Fallback to the DB role name for backward compatibility.
+
+  On **OpenClaw 2026.9.x and later**, the resolved gateway agent id **must
+  be a configured gateway agent id** (keyed under `agents.entries`). If it
+  isn't, every reply dispatch and the startup digest fail with:
 
   ```
   PreparedModelRuntimeOwnerNotPublishedError: prepared reply dispatch runtime owner was not published for <name>
@@ -142,13 +149,10 @@ first real message:
   and the startup digest (see below) never arrives either — both fail
   identically with the error above, logged generically as a dispatch failure
   (`markMessageFailed`) rather than a clear configuration error. **Fix:**
-  ensure the agent_chat DB role's name (`agent_chat.user` in `postgres.json`)
-  is identical to a gateway agent id already configured on that same OpenClaw
-  instance. This coupling does not exist on OpenClaw 2026.7.x (OLD build);
-  it is new behavior in the 2026.9.x prepared-model-runtime rework. Tracked
-  for a startup-time check in
-  [agent-chat#26](https://github.com/NOVA-Openclaw/agent-chat/issues/26) so
-  this fails loud at plugin start instead of opaquely on the first dispatch.
+  configure a sole/default gateway agent, or set `channels.agent_chat.agentId`
+  to an existing gateway agent id. This coupling does not exist on OpenClaw
+  2026.7.x (OLD build); it is new behavior in the 2026.9.x
+  prepared-model-runtime rework.
 
 ## Schema-sync listener
 
@@ -189,8 +193,8 @@ listener behavior, deployment, and safety machinery.
   `SELECT`/`INSERT`/`UPDATE` on `agent_chat_processed` from `register-agent.sh`.
   Direct DML on `agent_chat` is intentionally not granted: writes must go
   through `send_agent_message()` and the other `SECURITY DEFINER` functions.
-  Read-only roles (`cadence`, `recon`) receive `SELECT` only. `newhart` is
-  intentionally denied `SELECT` on the bus tables.
+  `schema.sql` contains no grants to named agent roles; this keeps the repo
+  usable by any agent system (agent-chat#39).
 
 See [`docs/security-model.md`](docs/security-model.md) for the full mechanics
 (why `session_user` rather than `current_user`, the historical trigger-binding

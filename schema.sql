@@ -521,8 +521,6 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_pending_alerts(text) TO victoria, "nova-staging";
-
 -- Name: agent_chat_mark_alerts_seen(integer[]); Type: FUNCTION; Schema: public; Owner: -
 -- Marks breaker alerts as seen. Returns the number of alerts newly marked.
 CREATE OR REPLACE FUNCTION public.agent_chat_mark_alerts_seen(p_alert_ids integer[])
@@ -552,8 +550,6 @@ EXCEPTION WHEN insufficient_privilege THEN
         RAISE;
     END IF;
 END $$;
-
-GRANT EXECUTE ON FUNCTION public.agent_chat_mark_alerts_seen(integer[]) TO victoria, "nova-staging";
 
 -- Name: agent_chat_mute_peer(text, integer, text); Type: FUNCTION; Schema: public; Owner: -
 -- Lets session_user mute inbound wakes from p_peer for p_minutes (default 60).
@@ -626,8 +622,6 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_mute_peer(text, integer, text) TO victoria, "nova-staging";
-
 -- Name: agent_chat_unmute_peer(text); Type: FUNCTION; Schema: public; Owner: -
 -- Lets session_user remove a mute on p_peer before its expiry time.
 CREATE OR REPLACE FUNCTION public.agent_chat_unmute_peer(p_peer text)
@@ -668,8 +662,6 @@ EXCEPTION WHEN insufficient_privilege THEN
     END IF;
 END $$;
 
-GRANT EXECUTE ON FUNCTION public.agent_chat_unmute_peer(text) TO victoria, "nova-staging";
-
 -- Name: agent_chat_is_muted(text, text); Type: FUNCTION; Schema: public; Owner: -
 -- Returns true if p_agent currently has an active, non-expired mute on p_peer.
 -- The plugin uses this helper to decide whether an inbound message from p_peer
@@ -700,8 +692,6 @@ EXCEPTION WHEN insufficient_privilege THEN
         RAISE;
     END IF;
 END $$;
-
-GRANT EXECUTE ON FUNCTION public.agent_chat_is_muted(text, text) TO victoria, "nova-staging";
 
 -- Name: send_agent_message(text, text, text[], interval, integer); Type: FUNCTION; Schema: public; Owner: -
 -- Defensive drop of all known historical signatures before CREATE OR REPLACE.
@@ -1053,135 +1043,72 @@ CREATE TRIGGER trg_enforce_agent_chat_function_use
 --
 -- Privileges
 --
--- Default privileges mirror the live production dump so future objects created
--- by postgres/nova get the same grants; explicit grants make current objects
--- deterministic regardless of which role creates them.
+-- This schema is intentionally portable: it contains NO grants to named
+-- agent roles. Per-agent access is applied by register-agent.sh, which
+-- takes an arbitrary agent name argument and grants:
+--   * SELECT on public.agent_chat
+--   * SELECT, INSERT, UPDATE on public.agent_chat_processed
+-- Bus functions (send_agent_message, mark_agent_chat_status, and the
+-- breaker/mute helpers) are SECURITY DEFINER owned by postgres and remain
+-- executable via PUBLIC default privileges, so no per-role EXECUTE grants
+-- are required. Sender identity is enforced inside each function by
+-- comparing p_sender against session_user, which SECURITY DEFINER does not
+-- change; PUBLIC EXECUTE therefore does not allow sender spoofing.
+--
+-- This closes agent-chat#39: the repo never grants access by agent name.
 --
 
--- Default privileges for role postgres. Wrapped so a non-superuser devtest apply
--- can still succeed.
-DO $$
-BEGIN
-    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE ON SEQUENCES TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT DELETE, INSERT, SELECT, UPDATE ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-EXCEPTION WHEN insufficient_privilege THEN
-    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
-        RAISE NOTICE 'Skipping postgres default privileges: current user is not a superuser';
-    ELSE
-        RAISE;
-    END IF;
-END $$;
-
--- Default privileges for role nova. Wrapped so a non-superuser devtest apply
--- can still succeed.
-DO $$
-BEGIN
-    ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
-EXCEPTION WHEN insufficient_privilege THEN
-    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
-        RAISE NOTICE 'Skipping nova default privileges: current user is not a superuser';
-    ELSE
-        RAISE;
-    END IF;
-END $$;
-
--- Explicit table grants for nova-ecosystem agent roles
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-
--- Newhart's access is intentionally restricted: revoke SELECT that would
--- otherwise be granted by nova default privileges.
-REVOKE SELECT ON TABLE public.agent_chat FROM newhart;
-REVOKE SELECT ON TABLE public.agent_chat_processed FROM newhart;
-
--- Peer agent graybeard gets the same full CRUD as subagents.
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO graybeard;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO graybeard;
-
--- nova-staging: SEND capability. EXECUTE on send_agent_message is granted
--- explicitly below; SELECT on the bus tables lets it read/poll.
-GRANT SELECT ON TABLE public.agent_chat TO "nova-staging";
-GRANT SELECT ON TABLE public.agent_chat_processed TO "nova-staging";
-
--- victoria: send+receive capability on the shared cross-ecosystem bus.
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO victoria;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO victoria;
-
--- Cross-ecosystem consumers. cadence is read-only on agent_chat; recon is
--- read-only on agent_chat but has full CRUD on agent_chat_processed.
-GRANT SELECT ON TABLE public.agent_chat TO cadence, recon;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO recon;
-
--- Sequence grants (replicate live production matrix; newhart intentionally absent)
-GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO argus, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, nova, quill, recon, scribe, ticker;
-GRANT SELECT, USAGE ON SEQUENCE public.agent_chat_id_seq TO athena, scout;
-GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO victoria;
-GRANT SELECT ON SEQUENCE public.agent_chat_id_seq TO newhart;
--- nova-staging only needs SEND capability; it does not need to allocate sequence values.
-
--- View grants (replicate live production matrix)
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.v_agent_chat_recent TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, newhart, nova, quill, scout, scribe, ticker;
-GRANT SELECT ON TABLE public.v_agent_chat_recent TO graybeard, "nova-staging";
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.v_agent_chat_stats TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, newhart, nova, quill, scout, scribe, ticker;
-GRANT SELECT ON TABLE public.v_agent_chat_stats TO graybeard, "nova-staging";
-
--- victoria view grants (read access for receive/polling)
-GRANT SELECT ON TABLE public.v_agent_chat_recent TO victoria;
-GRANT SELECT ON TABLE public.v_agent_chat_stats TO victoria;
-
--- Function grants: existing functions default to PUBLIC EXECUTE. We explicitly
--- document the required EXECUTE capability for victoria and nova-staging
--- without revoking PUBLIC access.
-GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
-GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
-
--- agent-chat#34/#36: lock down direct writes on the circuit-breaker control
--- tables the same way agent_chat itself is locked down. The `ALTER DEFAULT
--- PRIVILEGES FOR ROLE postgres ... GRANT DELETE, INSERT, SELECT, UPDATE ON
--- TABLES` block above applies automatically to any new table postgres
--- creates, including these tables -- so without this explicit revoke, every
--- standard agent role would get direct INSERT/UPDATE/DELETE on the breaker
--- state and audit tables, defeating "send_agent_message() is the only write
--- path". SELECT is preserved for diagnosability (loud-in-the-log constraint).
+-- agent-chat#34/#36/#39: lock down direct writes on the circuit-breaker
+-- control tables. Instead of a hardcoded role roster, discover the roles
+-- that already have access to the bus (SELECT on agent_chat or EXECUTE on
+-- send_agent_message) and apply the same least-privilege shape to the
+-- control tables: SELECT only, no INSERT/UPDATE/DELETE. This keeps fresh
+-- installs portable (no named roles required) while preserving the
+-- intended lockdown on upgraded databases that already have agent roles.
 DO $$
 DECLARE
-    v_roles CONSTANT text[] := ARRAY[
-        'argus','athena','coder','conductor','erato','flint','gem','gidget',
-        'graybeard','hermes','iris','marcie','nova','quill','scout','scribe',
-        'ticker','victoria'
-    ];
     v_role text;
     v_table text;
-BEGIN
-    FOREACH v_table IN ARRAY ARRAY[
+    v_control_tables text[] := ARRAY[
         'agent_chat_error_templates',
         'agent_chat_breaker_config',
         'agent_chat_breaker_state',
         'agent_chat_breaker_alerts',
         'agent_chat_mutes',
         'agent_chat_suppressed_log'
-    ]
+    ];
+BEGIN
+    FOR v_role IN
+        SELECT DISTINCT grantee::regrole::text
+        FROM information_schema.role_table_grants
+        WHERE table_schema = 'public'
+          AND table_name = 'agent_chat'
+          AND privilege_type = 'SELECT'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
+        UNION
+        SELECT DISTINCT grantee::regrole::text
+        FROM information_schema.role_routine_grants
+        WHERE routine_schema = 'public'
+          AND routine_name = 'send_agent_message'
+          AND privilege_type = 'EXECUTE'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
     LOOP
-        FOREACH v_role IN ARRAY v_roles
+        -- Skip system/owner roles: the table owner must keep inherent
+        -- privileges so migrations (which may INSERT into control tables)
+        -- can run in non-superuser dev/test environments.
+        IF v_role = session_user OR v_role = 'postgres' THEN
+            CONTINUE;
+        END IF;
+        FOREACH v_table IN ARRAY v_control_tables
         LOOP
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-                -- Never revoke from the table owner: the owner must keep its
-                -- inherent privileges so migrations (which may INSERT into
-                -- these control tables) can run in non-superuser dev/test
-                -- environments. In production the owner is postgres, which is
-                -- not in v_roles, so this guard has no security effect.
-                IF v_role = session_user THEN
-                    CONTINUE;
-                END IF;
-                EXECUTE format(
-                    'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
-                    v_table, v_role
-                );
-                EXECUTE format(
-                    'GRANT SELECT ON TABLE public.%I TO %I',
-                    v_table, v_role
-                );
-            END IF;
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
+                v_table, v_role
+            );
+            EXECUTE format(
+                'GRANT SELECT ON TABLE public.%I TO %I',
+                v_table, v_role
+            );
         END LOOP;
     END LOOP;
 END $$;
