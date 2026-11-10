@@ -1164,6 +1164,42 @@ _tc11x_send_as_b() {
     act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$limited_role\";" >/dev/null 2>&1 || true
 }
 
+@test "TC-14: register-agent.sh applies the standard grant set the plugin needs" {
+    run env PGUSER=agentchat_test "$INSTALLER"
+    [ "$status" -eq 0 ]
+
+    local fixture_role fixture_pass fixture_pgpass
+    fixture_role="act_$(tr -dc 'a-z0-9' </dev/urandom | head -c 6)_plugin"
+    fixture_pass="$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24)"
+
+    fixture_pgpass="$(mktemp)"
+    chmod 600 "$fixture_pgpass"
+    printf 'localhost:%s:*:%s:%s\n' "$ACT_ADMIN_PORT" "$fixture_role" "$fixture_pass" >> "$fixture_pgpass"
+
+    AGENT_CHAT_DB_NAME="$AGENT_CHAT_DB_NAME" run env PGUSER=agentchat_test "$REGISTER" --password "$fixture_pass" "$fixture_role"
+    [ "$status" -eq 0 ]
+
+    # The plugin needs to claim and update processed rows as this role.
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'INSERT');"
+    [ "$output" = "t" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_processed', 'UPDATE');"
+    [ "$output" = "t" ]
+
+    # The plugin needs to call the public functions it exposes as tools.
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_function_privilege('$fixture_role', 'public.send_agent_message(text,text,text[],interval,integer)', 'EXECUTE');"
+    [ "$output" = "t" ]
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_function_privilege('$fixture_role', 'public.mark_agent_chat_status(bigint[],text)', 'EXECUTE');"
+    [ "$output" = "t" ]
+
+    # Direct writes to the circuit-breaker control tables are intentionally
+    # locked down; callers must go through SECURITY DEFINER functions.
+    run act_admin_psql "$AGENT_CHAT_DB_NAME" -At -c "SELECT has_table_privilege('$fixture_role', 'public.agent_chat_breaker_state', 'INSERT');"
+    [ "$output" = "f" ]
+
+    rm -f "$fixture_pgpass"
+    act_admin_psql postgres -v ON_ERROR_STOP=0 -c "DROP ROLE IF EXISTS \"$fixture_role\";" >/dev/null 2>&1 || true
+}
+
 # ─── install-plugin.sh (TC-60/61) ───────────────────────────────────────────
 
 @test "TC-60: install-plugin.sh writes postgres.json agent_chat section" {
