@@ -20,7 +20,7 @@ An adoption run is different. The live pre-extraction database has:
   exist before the extraction, so `install.sh`'s idempotency check
   (`_is_up_to_date`, which compares `schema_version` MAX against
   `_get_expected_version` — the highest numeric prefix among files in
-  `migrations/`, currently 7) will correctly treat an unmigrated production DB
+  `migrations/`, currently 9) will correctly treat an unmigrated production DB
   as needing the full schema + migrations applied.
 - **The old, broken trigger binding** — `trg_enforce_agent_chat_function_use`
   bound to `BEFORE INSERT` only (not `UPDATE`/`DELETE`). See
@@ -34,11 +34,11 @@ An adoption run is different. The live pre-extraction database has:
   role plus cross-ecosystem read-only consumers.
 
 The migration path (`schema.sql`'s idempotent apply, then every file in
-`migrations/` in sorted order — `001` through `007` as of this writing) is
+`migrations/` in sorted order — `001` through `009` as of this writing) is
 designed to transition this exact starting state safely. The adoption-specific
 concerns below center on `002` (the atomicity requirement) since that is the
 migration that first touches live DML-enforcement behavior; later migrations
-(`003`–`007`) are additive schema/function changes that carry the same general
+(`003`–`009`) are additive schema/function changes that carry the same general
 idempotency guarantees but not `002`'s specific cutover risk. This guide walks
 through what to verify before, during, and after.
 
@@ -122,7 +122,7 @@ pg_restore -d agent_chat_rehearsal agent_chat-pre-adoption-YYYYMMDD.dump
 AGENT_CHAT_DB_NAME=agent_chat_rehearsal bash install.sh
 
 # 3. Verify.
-psql -d agent_chat_rehearsal -c "SELECT MAX(version) FROM schema_version;"   # expect the current highest migrations/ prefix (7 as of this writing)
+psql -d agent_chat_rehearsal -c "SELECT MAX(version) FROM schema_version;"   # expect the current highest migrations/ prefix (9 as of this writing)
 psql -d agent_chat_rehearsal -c "SELECT COUNT(*) FROM agent_chat;"          # compare to pre-migration count
 psql -d agent_chat_rehearsal -c "\d agent_chat"                              # confirm trigger binding
 ```
@@ -176,7 +176,7 @@ partial rollback of individual migration files.
 
 - Confirm `install.sh`'s idempotent re-run reports "up to date"
   (`schema_version <N>, all expected objects present`, where `<N>` is the
-  current highest numeric prefix in `migrations/` — 7 as of this writing)
+  current highest numeric prefix in `migrations/` — 9 as of this writing)
   rather than re-applying anything.
 - Run `register-agent.sh --check <agent_name>` for a few existing agents to
   confirm their roles/grants survived unchanged.

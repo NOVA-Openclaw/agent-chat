@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_processed (
     responded_at timestamp,
     handled_at timestamp,
     expired_at timestamp,
+    skipped_at timestamp,
     error_message text,
     status public.agent_chat_status DEFAULT 'responded'::public.agent_chat_status,
     CONSTRAINT agent_chat_processed_pkey PRIMARY KEY (chat_id, agent)
@@ -156,7 +157,9 @@ INSERT INTO public.agent_chat_error_templates (pattern, description) VALUES
     ('context is too large and auto-compaction could not recover this turn',
      'agent-chat#11 occurrence 4: runtime auto-compaction-failure template'),
     ('context is saturated and cannot process turns',
-     'agent-chat#11 occurrence 4: agent-authored saturation notice -- self-describes as non-actionable and sends anyway')
+     'agent-chat#11 occurrence 4: agent-authored saturation notice -- self-describes as non-actionable and sends anyway'),
+    ('The tool run finished, but no final summary was produced',
+     'agent-chat#36: gateway fallback text for silent/empty final turns; must never be delivered to agent_chat peers')
 ON CONFLICT ON CONSTRAINT agent_chat_error_templates_pattern_key DO NOTHING;
 
 -- Name: agent_chat_normalize_for_match(text); Type: FUNCTION; Schema: public; Owner: -
@@ -252,40 +255,121 @@ COMMENT ON FUNCTION public.agent_chat_message_shape(text) IS
     'body. Used by the circuit breaker''s content-novelty escape hatch to '
     'distinguish a repeating storm body from genuinely new content.';
 
--- Name: agent_chat_breaker_state; Type: TABLE; Schema: public; Owner: -
--- agent-chat#11: per ordered (sender, recipient) rolling-window counter for
--- the courtesy-reply-storm circuit breaker. recipient may be '*' (a
--- sender-scoped breaker for broadcasts, agent-chat#11 BLOCKING #3 fix,
--- 2026-09-03 QA remediation). last_shape/escape_count support the
--- content-novelty escape hatch (BLOCKING #2 fix).
-CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_state (
-    sender text NOT NULL,
-    recipient text NOT NULL,
-    window_start timestamptz NOT NULL DEFAULT now(),
-    message_count integer NOT NULL DEFAULT 0,
-    tripped boolean NOT NULL DEFAULT false,
-    suppressed_count integer NOT NULL DEFAULT 0,
-    last_message_at timestamptz NOT NULL DEFAULT now(),
-    last_shape text NOT NULL DEFAULT '',
-    escape_count integer NOT NULL DEFAULT 0,
-    CONSTRAINT agent_chat_breaker_state_pkey PRIMARY KEY (sender, recipient)
+-- Name: agent_chat_breaker_config; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#34/#36: configurable per-pair loop-detection threshold and
+-- rolling window. A NULL pair acts as the global default. Per-pair rows
+-- override the default for that unordered pair.
+CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_config (
+    id SERIAL PRIMARY KEY,
+    pair_a text,
+    pair_b text,
+    threshold integer NOT NULL DEFAULT 6,
+    "window" interval NOT NULL DEFAULT interval '5 minutes',
+    CONSTRAINT agent_chat_breaker_config_pair_key UNIQUE (pair_a, pair_b),
+    CONSTRAINT agent_chat_breaker_config_pair_order CHECK (
+        pair_a IS NULL OR pair_b IS NULL OR pair_a < pair_b
+    ),
+    CONSTRAINT agent_chat_breaker_config_positive_threshold CHECK (threshold > 0)
 );
 
-COMMENT ON COLUMN public.agent_chat_breaker_state.last_shape IS
-    'agent-chat#11 BLOCKING #2 fix: agent_chat_message_shape() of the most '
-    'recently processed message for this pair. A subsequent message whose '
-    'shape differs is treated as content-novel and may escape a tripped '
-    'breaker (bounded by escape_count).';
+COMMENT ON TABLE public.agent_chat_breaker_config IS
+    'agent-chat#34/#36: configurable loop-detection threshold and rolling '
+    'window. NULL pair = global default; concrete pair rows override it.';
 
-COMMENT ON COLUMN public.agent_chat_breaker_state.escape_count IS
-    'agent-chat#11 BLOCKING #2 fix: number of content-novelty escapes granted '
-    'since the last full reset. Capped at 3 (generous but bounded) so varying '
-    'the wording every message cannot become an infinite bypass of the '
-    'breaker.';
+-- Seed the global default: 6 messages in 5 minutes.
+INSERT INTO public.agent_chat_breaker_config (pair_a, pair_b, threshold, "window")
+VALUES (NULL, NULL, 6, interval '5 minutes')
+ON CONFLICT ON CONSTRAINT agent_chat_breaker_config_pair_key DO NOTHING;
+
+-- Name: agent_chat_breaker_state; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#34/#36: per unordered pair rolling-window counter. The breaker
+-- never suppresses delivery; when the threshold is crossed it records one
+-- alert per trip/window and continues delivering normally.
+CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_state (
+    pair_a text NOT NULL,
+    pair_b text NOT NULL,
+    window_start timestamptz NOT NULL DEFAULT now(),
+    message_count integer NOT NULL DEFAULT 0,
+    alerted boolean NOT NULL DEFAULT false,
+    last_message_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_chat_breaker_state_pkey PRIMARY KEY (pair_a, pair_b),
+    CONSTRAINT agent_chat_breaker_state_pair_order CHECK (pair_a < pair_b)
+);
+
+COMMENT ON TABLE public.agent_chat_breaker_state IS
+    'agent-chat#34/#36: per unordered pair rolling-window message counter. '
+    'alerted=true means an alert has already been emitted for the current '
+    'window; it resets to false when the window rolls forward.';
+
+-- Name: agent_chat_breaker_alerts; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#34/#36: one row per trip per pair/window. The plugin reads
+-- pending alerts via agent_chat_pending_alerts(agent) and can mark them
+-- seen via agent_chat_mark_alerts_seen(integer[]).
+CREATE TABLE IF NOT EXISTS public.agent_chat_breaker_alerts (
+    id SERIAL PRIMARY KEY,
+    pair_a text NOT NULL,
+    pair_b text NOT NULL,
+    window_start timestamptz NOT NULL,
+    window_end timestamptz NOT NULL,
+    message_count integer NOT NULL,
+    threshold integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    seen_at timestamptz,
+    CONSTRAINT agent_chat_breaker_alerts_pair_order CHECK (pair_a < pair_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_agent_chat_breaker_alerts_unseen
+    ON public.agent_chat_breaker_alerts (pair_a, pair_b) WHERE seen_at IS NULL;
+
+-- Name: notify_agent_chat_breaker_alert(); Type: FUNCTION; Schema: public; Owner: -
+CREATE OR REPLACE FUNCTION public.notify_agent_chat_breaker_alert()
+RETURNS trigger
+LANGUAGE plpgsql
+VOLATILE
+AS $$
+BEGIN
+    PERFORM pg_notify('agent_chat_breaker_alert', json_build_object(
+        'alert_id', NEW.id,
+        'pair_a', NEW.pair_a,
+        'pair_b', NEW.pair_b,
+        'message_count', NEW.message_count,
+        'threshold', NEW.threshold
+    )::text);
+    RETURN NEW;
+END;
+$$;
+
+DROP TRIGGER IF EXISTS trg_notify_agent_chat_breaker_alert ON public.agent_chat_breaker_alerts;
+CREATE TRIGGER trg_notify_agent_chat_breaker_alert
+    AFTER INSERT ON public.agent_chat_breaker_alerts
+    FOR EACH ROW
+    EXECUTE FUNCTION public.notify_agent_chat_breaker_alert();
+
+ALTER TABLE public.agent_chat_breaker_alerts ENABLE ALWAYS TRIGGER trg_notify_agent_chat_breaker_alert;
+
+-- Name: agent_chat_mutes; Type: TABLE; Schema: public; Owner: -
+-- agent-chat#34/#36: agent-initiated peer mutes. An agent can pause inbound
+-- turn waking from a specific peer for a duration. Messages are still stored
+-- in agent_chat normally, but the plugin checks agent_chat_is_muted() before
+-- dispatching/waking the muting agent's session.
+CREATE TABLE IF NOT EXISTS public.agent_chat_mutes (
+    agent text NOT NULL,
+    peer text NOT NULL,
+    muted_until timestamptz NOT NULL,
+    reason text,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    CONSTRAINT agent_chat_mutes_pkey PRIMARY KEY (agent, peer),
+    CONSTRAINT agent_chat_mutes_no_self CHECK (agent <> peer)
+);
+
+COMMENT ON TABLE public.agent_chat_mutes IS
+    'agent-chat#34/#36: per-(agent, peer) mute window. Messages are stored in '
+    'agent_chat, but inbound wakes for agent from peer are suppressed while NOW() < muted_until.';
 
 -- Name: agent_chat_suppressed_log; Type: TABLE; Schema: public; Owner: -
--- agent-chat#11: audit trail for every message send_agent_message() refused
--- to deliver. Loud in the log, silent on the bus.
+-- agent-chat#11/#36: audit trail for sender-side filters only. Under the new
+-- design the circuit breaker never suppresses delivery, so loop_breaker rows
+-- are historical only.
 CREATE TABLE IF NOT EXISTS public.agent_chat_suppressed_log (
     id SERIAL PRIMARY KEY,
     suppressed_at timestamptz NOT NULL DEFAULT now(),
@@ -295,7 +379,7 @@ CREATE TABLE IF NOT EXISTS public.agent_chat_suppressed_log (
     message_sample text NOT NULL,
     window_message_count integer,
     CONSTRAINT agent_chat_suppressed_log_reason_check
-        CHECK (reason IN ('sender_filter_error_template', 'loop_breaker'))
+        CHECK (reason IN ('sender_filter_error_template'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_agent_chat_suppressed_log_time
@@ -303,7 +387,7 @@ CREATE INDEX IF NOT EXISTS idx_agent_chat_suppressed_log_time
 
 -- Name: mark_agent_chat_status(bigint[], text); Type: FUNCTION; Schema: public; Owner: -
 -- SECURITY DEFINER function that lets an agent mark its own agent_chat_processed
--- rows as terminal ('handled' or 'expired').
+-- rows as terminal ('handled', 'expired', or 'skipped').
 --
 -- Authorization rule (mirrors send_agent_message reply_to authorization):
 -- the caller may mark a message only if they are a named recipient of it
@@ -316,24 +400,26 @@ CREATE INDEX IF NOT EXISTS idx_agent_chat_suppressed_log_time
 --
 -- Race safety: claimMessage may insert a 'received' row concurrently. We use
 -- INSERT ... ON CONFLICT (chat_id, agent) DO NOTHING, then the guarded UPDATE.
--- If the insert lost the race, the update still applies. If the insert won,
+-- If the insert lost the race, the update still applies; if the insert won,
 -- the row already has the requested terminal status and the update is a no-op.
 --
--- Cross-agent ids, missing ids, and messages the caller is not authorized to
--- mark are silently ignored (partial success, no error). Terminal statuses
--- never regress.
+-- Returns the ids that were actually applied. The return type changed from
+-- void to bigint[], which is backwards compatible for raw SQL callers that
+-- ignore the result. Terminal statuses never regress.
 DROP FUNCTION IF EXISTS public.mark_agent_chat_status(bigint[], text);
 
 CREATE OR REPLACE FUNCTION public.mark_agent_chat_status(
     p_chat_ids bigint[],
     p_status text
 )
-RETURNS void
+RETURNS bigint[]
 LANGUAGE plpgsql
 VOLATILE
 SECURITY DEFINER
 SET search_path = pg_catalog, public
 AS $$
+DECLARE
+    v_applied bigint[];
 BEGIN
     IF p_chat_ids IS NULL THEN
         RAISE EXCEPTION 'mark_agent_chat_status: p_chat_ids cannot be NULL';
@@ -343,57 +429,46 @@ BEGIN
         RAISE EXCEPTION 'mark_agent_chat_status: p_status cannot be NULL or empty';
     END IF;
 
-    IF p_status NOT IN ('handled', 'expired') THEN
+    IF p_status NOT IN ('handled', 'expired', 'skipped') THEN
         -- Valid enum labels that are not allowed get our own clear error;
         -- non-existent labels (e.g. 'foo') fail naturally with the PostgreSQL
         -- invalid-input-value error for the enum type.
         PERFORM p_status::public.agent_chat_status;
-        RAISE EXCEPTION 'mark_agent_chat_status: status must be "handled" or "expired" (got %)', p_status;
+        RAISE EXCEPTION 'mark_agent_chat_status: status must be "handled", "expired" or "skipped" (got %)', p_status;
     END IF;
 
-    -- Step 1: create a processed row for authorized messages when none exists.
-    -- Authorization is enforced here; non-recipients and non-broadcasts are
-    -- skipped because the JOIN to agent_chat will not match.
-    IF p_status = 'handled' THEN
-        INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at)
-        SELECT ac.id, session_user, 'handled', NOW()
+    -- Create a processed row for authorized messages when none exists,
+    -- or update an existing non-terminal row. Terminal statuses never regress.
+    WITH inserted AS (
+        INSERT INTO public.agent_chat_processed (chat_id, agent, status, handled_at, expired_at, skipped_at)
+        SELECT ac.id, session_user, p_status::public.agent_chat_status,
+               CASE WHEN p_status = 'handled' THEN NOW() ELSE NULL END,
+               CASE WHEN p_status = 'expired' THEN NOW() ELSE NULL END,
+               CASE WHEN p_status = 'skipped' THEN NOW() ELSE NULL END
         FROM public.agent_chat ac
         WHERE ac.id = ANY(p_chat_ids)
           AND (
               session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
               OR '*' = ANY(ac.recipients)
           )
-        ON CONFLICT (chat_id, agent) DO NOTHING;
-    ELSIF p_status = 'expired' THEN
-        INSERT INTO public.agent_chat_processed (chat_id, agent, status, expired_at)
-        SELECT ac.id, session_user, 'expired', NOW()
-        FROM public.agent_chat ac
-        WHERE ac.id = ANY(p_chat_ids)
-          AND (
-              session_user = ANY(ARRAY(SELECT LOWER(unnest(ac.recipients))))
-              OR '*' = ANY(ac.recipients)
-          )
-        ON CONFLICT (chat_id, agent) DO NOTHING;
-    END IF;
+        ON CONFLICT (chat_id, agent) DO NOTHING
+        RETURNING chat_id
+    ),
+    updated AS (
+        UPDATE public.agent_chat_processed
+        SET status = p_status::public.agent_chat_status,
+            handled_at = CASE WHEN p_status = 'handled' THEN NOW() ELSE handled_at END,
+            expired_at = CASE WHEN p_status = 'expired' THEN NOW() ELSE expired_at END,
+            skipped_at = CASE WHEN p_status = 'skipped' THEN NOW() ELSE skipped_at END
+        WHERE chat_id = ANY(p_chat_ids)
+          AND agent = session_user
+          AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed')
+        RETURNING chat_id
+    )
+    SELECT array_agg(DISTINCT x.chat_id) INTO v_applied
+    FROM (SELECT chat_id FROM inserted UNION ALL SELECT chat_id FROM updated) x;
 
-    -- Step 2: update any existing own rows that are not yet terminal. This
-    -- covers pre-existing non-terminal rows and rows inserted concurrently by
-    -- claimMessage with status 'received'.
-    IF p_status = 'handled' THEN
-        UPDATE public.agent_chat_processed
-        SET status = 'handled',
-            handled_at = NOW()
-        WHERE chat_id = ANY(p_chat_ids)
-          AND agent = session_user
-          AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed');
-    ELSIF p_status = 'expired' THEN
-        UPDATE public.agent_chat_processed
-        SET status = 'expired',
-            expired_at = NOW()
-        WHERE chat_id = ANY(p_chat_ids)
-          AND agent = session_user
-          AND status NOT IN ('responded', 'expired', 'handled', 'skipped', 'failed');
-    END IF;
+    RETURN COALESCE(v_applied, ARRAY[]::bigint[]);
 END;
 $$;
 
@@ -401,7 +476,221 @@ DO $$
 BEGIN
     ALTER FUNCTION public.mark_agent_chat_status(bigint[], text) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping mark_agent_chat_status owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping mark_agent_chat_status owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
+END $$;
+
+-- Name: agent_chat_pending_alerts(text); Type: FUNCTION; Schema: public; Owner: -
+-- Returns unseen breaker alerts for any pair involving the calling agent.
+-- The plugin calls this after receiving an 'agent_chat_breaker_alert' NOTIFY
+-- or on poll to decide whether to investigate a possible loop.
+CREATE OR REPLACE FUNCTION public.agent_chat_pending_alerts(p_agent text)
+RETURNS TABLE (
+    alert_id integer,
+    pair_a text,
+    pair_b text,
+    window_start timestamptz,
+    window_end timestamptz,
+    message_count integer,
+    threshold integer,
+    created_at timestamptz
+)
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+    SELECT id, pair_a, pair_b, window_start, window_end, message_count, threshold, created_at
+    FROM public.agent_chat_breaker_alerts
+    WHERE seen_at IS NULL
+      AND (LOWER(p_agent) = pair_a OR LOWER(p_agent) = pair_b)
+    ORDER BY created_at DESC;
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.agent_chat_pending_alerts(text) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_pending_alerts owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
+END $$;
+
+-- Name: agent_chat_mark_alerts_seen(integer[]); Type: FUNCTION; Schema: public; Owner: -
+-- Marks breaker alerts as seen. Returns the number of alerts newly marked.
+CREATE OR REPLACE FUNCTION public.agent_chat_mark_alerts_seen(p_alert_ids integer[])
+RETURNS integer
+LANGUAGE sql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+    WITH marked AS (
+        UPDATE public.agent_chat_breaker_alerts
+        SET seen_at = NOW()
+        WHERE id = ANY(p_alert_ids)
+          AND seen_at IS NULL
+        RETURNING id
+    )
+    SELECT count(*)::integer FROM marked;
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.agent_chat_mark_alerts_seen(integer[]) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_mark_alerts_seen owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
+END $$;
+
+-- Name: agent_chat_mute_peer(text, integer, text); Type: FUNCTION; Schema: public; Owner: -
+-- Lets session_user mute inbound wakes from p_peer for p_minutes (default 60).
+-- Records the mute in agent_chat_mutes and sends exactly ONE system notice to p_peer.
+CREATE OR REPLACE FUNCTION public.agent_chat_mute_peer(
+    p_peer text,
+    p_minutes integer DEFAULT 60,
+    p_reason text DEFAULT NULL
+)
+RETURNS timestamptz
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_agent         TEXT;
+    v_peer          TEXT;
+    v_minutes       INTEGER;
+    v_muted_until   TIMESTAMPTZ;
+    v_notice        TEXT;
+BEGIN
+    IF p_peer IS NULL OR trim(p_peer) = '' THEN
+        RAISE EXCEPTION 'agent_chat_mute_peer: p_peer cannot be NULL or empty';
+    END IF;
+
+    v_agent := session_user;
+    v_peer := LOWER(p_peer);
+
+    IF v_agent = v_peer THEN
+        RAISE EXCEPTION 'agent_chat_mute_peer: cannot mute yourself';
+    END IF;
+
+    v_minutes := COALESCE(p_minutes, 60);
+    IF v_minutes <= 0 THEN
+        v_minutes := 60;
+    END IF;
+
+    v_muted_until := NOW() + (v_minutes || ' minutes')::interval;
+
+    INSERT INTO public.agent_chat_mutes (agent, peer, muted_until, reason, created_at)
+    VALUES (v_agent, v_peer, v_muted_until, p_reason, NOW())
+    ON CONFLICT (agent, peer) DO UPDATE
+    SET muted_until = EXCLUDED.muted_until,
+        reason = EXCLUDED.reason,
+        created_at = EXCLUDED.created_at;
+
+    -- Send exactly ONE system notice to the peer so they stop sending too.
+    -- Formatted as: "<agent> has paused agent_chat with you until <time> UTC[: <reason>]"
+    v_notice := format('%s has paused agent_chat with you until %s UTC%s',
+        v_agent,
+        to_char(v_muted_until AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS'),
+        CASE WHEN p_reason IS NOT NULL AND trim(p_reason) <> '' THEN ': ' || trim(p_reason) ELSE '' END
+    );
+
+    PERFORM public.send_agent_message(v_agent, v_notice, ARRAY[v_peer]);
+
+    RETURN v_muted_until;
+END;
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.agent_chat_mute_peer(text, integer, text) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_mute_peer owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
+END $$;
+
+-- Name: agent_chat_unmute_peer(text); Type: FUNCTION; Schema: public; Owner: -
+-- Lets session_user remove a mute on p_peer before its expiry time.
+CREATE OR REPLACE FUNCTION public.agent_chat_unmute_peer(p_peer text)
+RETURNS boolean
+LANGUAGE plpgsql
+VOLATILE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+DECLARE
+    v_agent  TEXT;
+    v_peer   TEXT;
+    v_count  INTEGER;
+BEGIN
+    IF p_peer IS NULL OR trim(p_peer) = '' THEN
+        RAISE EXCEPTION 'agent_chat_unmute_peer: p_peer cannot be NULL or empty';
+    END IF;
+
+    v_agent := session_user;
+    v_peer := LOWER(p_peer);
+
+    DELETE FROM public.agent_chat_mutes
+    WHERE agent = v_agent AND peer = v_peer;
+
+    GET DIAGNOSTICS v_count = ROW_COUNT;
+    RETURN v_count > 0;
+END;
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.agent_chat_unmute_peer(text) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_unmute_peer owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
+END $$;
+
+-- Name: agent_chat_is_muted(text, text); Type: FUNCTION; Schema: public; Owner: -
+-- Returns true if p_agent currently has an active, non-expired mute on p_peer.
+-- The plugin uses this helper to decide whether an inbound message from p_peer
+-- to p_agent should trigger a session wake.
+CREATE OR REPLACE FUNCTION public.agent_chat_is_muted(p_agent text, p_peer text)
+RETURNS boolean
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = pg_catalog, public
+AS $$
+    SELECT EXISTS (
+        SELECT 1
+        FROM public.agent_chat_mutes
+        WHERE agent = LOWER(p_agent)
+          AND peer = LOWER(p_peer)
+          AND muted_until > NOW()
+    );
+$$;
+
+DO $$
+BEGIN
+    ALTER FUNCTION public.agent_chat_is_muted(text, text) OWNER TO postgres;
+EXCEPTION WHEN insufficient_privilege THEN
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping agent_chat_is_muted owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 -- Name: send_agent_message(text, text, text[], interval, integer); Type: FUNCTION; Schema: public; Owner: -
@@ -432,14 +721,13 @@ DECLARE
     v_sender         TEXT;
     v_recipients     TEXT[];
     v_expires_at     TIMESTAMPTZ;
-    v_has_artifact   BOOLEAN;
-    v_shape          TEXT;
     v_recipient      TEXT;
+    v_pair_a         TEXT;
+    v_pair_b         TEXT;
     v_state          RECORD;
-    v_escaped        BOOLEAN := false;
-    v_window         CONSTANT INTERVAL := interval '15 minutes';
-    v_threshold      CONSTANT INTEGER := 5; -- trips on the (threshold+1)th = 6th message
-    v_escape_limit   CONSTANT INTEGER := 3; -- agent-chat#11 BLOCKING #2 fix: max content-novelty escapes per trip epoch
+    v_config         RECORD;
+    v_window         INTERVAL;
+    v_threshold      INTEGER;
     v_original       RECORD;
 BEGIN
     -- Validate sender matches the actual connected database user.
@@ -458,9 +746,11 @@ BEGIN
         RAISE EXCEPTION 'send_agent_message: recipients cannot be NULL or empty — use ARRAY[''*''] for broadcast';
     END IF;
 
-    -- Normalize to lowercase
+    -- Normalize to lowercase, de-duplicate and sort.
     v_sender := LOWER(p_sender);
-    v_recipients := ARRAY(SELECT LOWER(unnest(p_recipients)));
+    v_recipients := ARRAY(
+        SELECT DISTINCT LOWER(r) FROM unnest(p_recipients) AS r ORDER BY LOWER(r)
+    );
 
     -- GUARD: reject self-addressed messages (no legitimate use case; always a typo)
     IF v_sender = ANY(v_recipients) THEN
@@ -487,15 +777,12 @@ BEGIN
         END IF;
     END IF;
 
-    -- agent-chat#11 DEFECT 1 FIX: sender-side runtime-error-template filter.
+    -- agent-chat#11/#36 DEFECT FIX: sender-side runtime-error-template filter.
     -- Applies unconditionally, before the breaker and before the insert, so it
     -- holds for every caller regardless of recipient count or that agent's own
     -- policy. Quarantine is silent on the bus (return NULL, no row inserted)
-    -- and loud in the log (one row per refused send in
-    -- agent_chat_suppressed_log) -- raising an exception here would itself
-    -- become a new error signal on the bus, reproducing the failure mode.
-    -- (2026-09-03 QA remediation: agent_chat_is_error_template() now requires
-    -- essentially-whole-message coverage; see BLOCKING #1 above.)
+    -- and loud in the log -- raising an exception here would itself become a
+    -- new error signal on the bus, reproducing the failure mode.
     IF public.agent_chat_is_error_template(p_message) THEN
         INSERT INTO public.agent_chat_suppressed_log (reason, sender, recipients, message_sample)
         VALUES ('sender_filter_error_template', v_sender, v_recipients, left(p_message, 500));
@@ -507,107 +794,76 @@ BEGIN
         v_expires_at := NOW() + p_ttl;
     END IF;
 
-    -- agent-chat#11 DEFECT 2 FIX: bus-side circuit breaker.
-    -- 2026-09-03 QA remediation (BLOCKING #3): scoping now covers single
-    -- recipients INCLUDING the '*' broadcast target -- a sender-scoped
-    -- breaker keyed on (sender, '*'), since a broadcast has no well-defined
-    -- ordered pair with a single counterparty. Multi-recipient, non-broadcast
-    -- sends (e.g. an explicit list of several named agents) remain out of
-    -- scope, unchanged from the original design.
-    IF array_length(v_recipients, 1) = 1 THEN
-        v_recipient := v_recipients[1];
-        v_has_artifact := public.agent_chat_has_artifact_ref(p_message);
-        v_shape := public.agent_chat_message_shape(p_message);
+    -- agent-chat#34/#36: alert-only pair breaker.
+    -- Counts both directions of an unordered pair together. When the
+    -- configurable threshold is crossed inside the rolling window, the message
+    -- is still delivered normally and one alert is recorded for the pair/window.
+    -- Broadcasts ('*') are not subject to the pair breaker.
+    FOREACH v_recipient IN ARRAY v_recipients
+    LOOP
+        IF v_recipient = '*' THEN
+            CONTINUE;
+        END IF;
+
+        -- Unordered pair key (alphabetical, lowercase).
+        IF v_sender < v_recipient THEN
+            v_pair_a := v_sender;
+            v_pair_b := v_recipient;
+        ELSE
+            v_pair_a := v_recipient;
+            v_pair_b := v_sender;
+        END IF;
+
+        -- Resolve configuration: concrete pair override, else global default.
+        SELECT threshold, "window" INTO v_config
+        FROM public.agent_chat_breaker_config
+        WHERE (pair_a = v_pair_a AND pair_b = v_pair_b)
+           OR (pair_a IS NULL AND pair_b IS NULL)
+        ORDER BY pair_a NULLS LAST
+        LIMIT 1;
+
+        IF NOT FOUND THEN
+            v_threshold := 6;
+            v_window := interval '5 minutes';
+        ELSE
+            v_threshold := v_config.threshold;
+            v_window := v_config."window";
+        END IF;
 
         SELECT * INTO v_state
         FROM public.agent_chat_breaker_state
-        WHERE sender = v_sender AND recipient = v_recipient
+        WHERE pair_a = v_pair_a AND pair_b = v_pair_b
         FOR UPDATE;
 
         IF NOT FOUND THEN
             INSERT INTO public.agent_chat_breaker_state
-                (sender, recipient, window_start, message_count, tripped, suppressed_count, last_message_at, last_shape, escape_count)
-            VALUES (v_sender, v_recipient, now(), 1, false, 0, now(), v_shape, 0);
-        ELSIF v_has_artifact OR v_state.last_message_at < now() - v_window THEN
-            -- New artifact referenced, or the pair has been quiet longer than
-            -- the window: this is not a loop. Reset the counter (and the
-            -- content-novelty escape budget/shape tracking).
+                (pair_a, pair_b, window_start, message_count, alerted, last_message_at)
+            VALUES (v_pair_a, v_pair_b, now(), 1, false, now());
+        ELSIF v_state.last_message_at < now() - v_window THEN
+            -- Window rolled forward: reset.
             UPDATE public.agent_chat_breaker_state
-            SET window_start = now(), message_count = 1, tripped = false,
-                suppressed_count = 0, last_message_at = now(),
-                last_shape = v_shape, escape_count = 0
-            WHERE sender = v_sender AND recipient = v_recipient;
+            SET window_start = now(), message_count = 1, alerted = false, last_message_at = now()
+            WHERE pair_a = v_pair_a AND pair_b = v_pair_b;
         ELSE
-            -- Same ordered pair, still inside the idle window, no new artifact.
+            -- Same window: increment count.
             UPDATE public.agent_chat_breaker_state
-            SET message_count = v_state.message_count + 1,
-                last_message_at = now()
-            WHERE sender = v_sender AND recipient = v_recipient
+            SET message_count = v_state.message_count + 1, last_message_at = now()
+            WHERE pair_a = v_pair_a AND pair_b = v_pair_b
             RETURNING * INTO v_state;
 
-            IF v_state.message_count > v_threshold THEN
-                -- agent-chat#11 BLOCKING #2 fix: content-novelty escape hatch.
-                -- v_state.last_shape/tripped/escape_count here are the values
-                -- from BEFORE this message (captured by the RETURNING above).
-                -- IMPORTANT: last_shape is frozen at the shape that TRIPPED the
-                -- breaker and is intentionally NOT updated on escape or on
-                -- ordinary suppression below -- if it were updated to each
-                -- escaping message's own shape, a second escaping message with
-                -- yet another different shape would compare against the FIRST
-                -- escapee's shape (always "different") rather than the
-                -- original storm shape, and a literal repeat of the original
-                -- storm body would incorrectly compare as "novel" and escape
-                -- again. Freezing last_shape at trip time makes escape
-                -- decisions and budget consumption depend only on how the
-                -- CURRENT message compares to the ORIGINAL storm shape.
-                IF v_shape IS DISTINCT FROM v_state.last_shape AND v_state.escape_count < v_escape_limit THEN
-                    -- Genuinely new-shaped content (e.g. a real urgent message
-                    -- arriving right after a storm of near-identical pings)
-                    -- escapes suppression even though the pair is tripped.
-                    -- The breaker stays tripped for the ORIGINAL shape; only
-                    -- this differently-shaped message is let through, and the
-                    -- escape budget is consumed so an unbounded run of
-                    -- differently-worded messages is still eventually capped.
-                    UPDATE public.agent_chat_breaker_state
-                    SET escape_count = v_state.escape_count + 1
-                    WHERE sender = v_sender AND recipient = v_recipient;
-                    v_escaped := true;
-                ELSE
-                    IF NOT v_state.tripped THEN
-                        -- First message past the threshold: log once, loudly.
-                        -- This message's shape becomes the frozen baseline
-                        -- ( "the storm shape" ) that all subsequent
-                        -- escape/suppress decisions for this trip compare
-                        -- against.
-                        INSERT INTO public.agent_chat_suppressed_log
-                            (reason, sender, recipients, message_sample, window_message_count)
-                        VALUES ('loop_breaker', v_sender, v_recipients, left(p_message, 500), v_state.message_count);
+            -- Alert once per trip/window when the threshold is crossed.
+            -- The message is always delivered; we never suppress.
+            IF v_state.message_count >= v_threshold AND NOT v_state.alerted THEN
+                INSERT INTO public.agent_chat_breaker_alerts
+                    (pair_a, pair_b, window_start, window_end, message_count, threshold)
+                VALUES (v_pair_a, v_pair_b, v_state.window_start, v_state.window_start + v_window, v_state.message_count, v_threshold);
 
-                        UPDATE public.agent_chat_breaker_state
-                        SET tripped = true, suppressed_count = 1, last_shape = v_shape
-                        WHERE sender = v_sender AND recipient = v_recipient;
-                    ELSE
-                        -- Already tripped, same shape as the original storm (or
-                        -- escape budget spent): stay silent on the bus AND on
-                        -- the log (the trip is already recorded); just keep
-                        -- the running count for diagnosability. last_shape is
-                        -- deliberately left untouched (see comment above).
-                        UPDATE public.agent_chat_breaker_state
-                        SET suppressed_count = suppressed_count + 1
-                        WHERE sender = v_sender AND recipient = v_recipient;
-                    END IF;
-
-                    RETURN NULL;
-                END IF;
-            ELSE
-                -- Not yet past threshold -- track shape so a later trip has an
-                -- accurate baseline to compare content-novelty against.
                 UPDATE public.agent_chat_breaker_state
-                SET last_shape = v_shape
-                WHERE sender = v_sender AND recipient = v_recipient;
+                SET alerted = true
+                WHERE pair_a = v_pair_a AND pair_b = v_pair_b;
             END IF;
         END IF;
-    END IF;
+    END LOOP;
 
     -- Atomic insert including reply_to; the enforce trigger allows this because
     -- current_user = 'postgres' inside the SECURITY DEFINER context.
@@ -640,7 +896,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.send_agent_message(text, text, text[], interval, integer) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping send_agent_message owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 -- Name: enforce_agent_chat_function_use(); Type: FUNCTION; Schema: public; Owner: -
@@ -705,7 +965,11 @@ DO $$
 BEGIN
     ALTER FUNCTION public.expire_old_chat(integer) OWNER TO postgres;
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping expire_old_chat owner assignment: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping expire_old_chat owner assignment: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;
 
 -- Name: notify_schema_change(); Type: FUNCTION; Schema: public; Owner: -
@@ -779,109 +1043,75 @@ CREATE TRIGGER trg_enforce_agent_chat_function_use
 --
 -- Privileges
 --
--- Default privileges mirror the live production dump so future objects created
--- by postgres/nova get the same grants; explicit grants make current objects
--- deterministic regardless of which role creates them.
+-- This schema is intentionally portable: it contains NO grants to named
+-- agent roles. Per-agent access is applied by register-agent.sh, which
+-- takes an arbitrary agent name argument and grants:
+--   * SELECT on public.agent_chat
+--   * SELECT, INSERT, UPDATE on public.agent_chat_processed
+-- Bus functions (send_agent_message, mark_agent_chat_status, and the
+-- breaker/mute helpers) are SECURITY DEFINER owned by postgres and remain
+-- executable via PUBLIC default privileges, so no per-role EXECUTE grants
+-- are required. Sender identity is enforced inside each function by
+-- comparing p_sender against session_user, which SECURITY DEFINER does not
+-- change; PUBLIC EXECUTE therefore does not allow sender spoofing.
+--
+-- This closes agent-chat#39: the repo never grants access by agent name.
 --
 
--- Default privileges for role postgres. Wrapped so a non-superuser devtest apply
--- can still succeed.
-DO $$
-BEGIN
-    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT USAGE ON SEQUENCES TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-    ALTER DEFAULT PRIVILEGES FOR ROLE postgres IN SCHEMA public GRANT DELETE, INSERT, SELECT, UPDATE ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping postgres default privileges: current user is not a superuser';
-END $$;
-
-ALTER DEFAULT PRIVILEGES FOR ROLE nova IN SCHEMA public GRANT SELECT ON TABLES TO argus, athena, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, newhart, "nova-staging", quill, scout, scribe, ticker;
-
--- Explicit table grants for nova-ecosystem agent roles
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, nova, quill, scout, scribe, ticker;
-
--- Newhart's access is intentionally restricted: revoke SELECT that would
--- otherwise be granted by nova default privileges.
-REVOKE SELECT ON TABLE public.agent_chat FROM newhart;
-REVOKE SELECT ON TABLE public.agent_chat_processed FROM newhart;
-
--- Peer agent graybeard gets the same full CRUD as subagents.
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO graybeard;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO graybeard;
-
--- nova-staging: SEND capability. EXECUTE on send_agent_message is granted
--- explicitly below; SELECT on the bus tables lets it read/poll.
-GRANT SELECT ON TABLE public.agent_chat TO "nova-staging";
-GRANT SELECT ON TABLE public.agent_chat_processed TO "nova-staging";
-
--- victoria: send+receive capability on the shared cross-ecosystem bus.
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat TO victoria;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO victoria;
-
--- Cross-ecosystem consumers. cadence is read-only on agent_chat; recon is
--- read-only on agent_chat but has full CRUD on agent_chat_processed.
-GRANT SELECT ON TABLE public.agent_chat TO cadence, recon;
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.agent_chat_processed TO recon;
-
--- Sequence grants (replicate live production matrix; newhart intentionally absent)
-GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO argus, coder, conductor, erato, flint, gem, gidget, graybeard, hermes, iris, marcie, nova, quill, recon, scribe, ticker;
-GRANT SELECT, USAGE ON SEQUENCE public.agent_chat_id_seq TO athena, scout;
-GRANT USAGE ON SEQUENCE public.agent_chat_id_seq TO victoria;
-GRANT SELECT ON SEQUENCE public.agent_chat_id_seq TO newhart;
--- nova-staging only needs SEND capability; it does not need to allocate sequence values.
-
--- View grants (replicate live production matrix)
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.v_agent_chat_recent TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, newhart, nova, quill, scout, scribe, ticker;
-GRANT SELECT ON TABLE public.v_agent_chat_recent TO graybeard, "nova-staging";
-GRANT DELETE, INSERT, SELECT, UPDATE ON TABLE public.v_agent_chat_stats TO argus, athena, coder, conductor, erato, flint, gem, gidget, hermes, iris, marcie, newhart, nova, quill, scout, scribe, ticker;
-GRANT SELECT ON TABLE public.v_agent_chat_stats TO graybeard, "nova-staging";
-
--- victoria view grants (read access for receive/polling)
-GRANT SELECT ON TABLE public.v_agent_chat_recent TO victoria;
-GRANT SELECT ON TABLE public.v_agent_chat_stats TO victoria;
-
--- Function grants: existing functions default to PUBLIC EXECUTE. We explicitly
--- document the required EXECUTE capability for victoria and nova-staging
--- without revoking PUBLIC access.
-GRANT EXECUTE ON FUNCTION public.send_agent_message(text, text, text[], interval, integer) TO victoria, "nova-staging";
-GRANT EXECUTE ON FUNCTION public.mark_agent_chat_status(bigint[], text) TO victoria, "nova-staging";
-
--- agent-chat#11: lock down direct writes on the new circuit-breaker control
--- tables the same way agent_chat itself is locked down. The `ALTER DEFAULT
--- PRIVILEGES FOR ROLE postgres ... GRANT DELETE, INSERT, SELECT, UPDATE ON
--- TABLES` block above applies automatically to any new table postgres
--- creates, including these three -- so without this explicit revoke, every
--- standard agent role would get direct INSERT/UPDATE/DELETE on the breaker
--- state and audit tables, defeating "send_agent_message() is the only write
--- path". SELECT is preserved for diagnosability (loud-in-the-log constraint).
+-- agent-chat#34/#36/#39: lock down direct writes on the circuit-breaker
+-- control tables. Instead of a hardcoded role roster, discover the roles
+-- that already have access to the bus (SELECT on agent_chat or EXECUTE on
+-- send_agent_message) and apply the same least-privilege shape to the
+-- control tables: SELECT only, no INSERT/UPDATE/DELETE. This keeps fresh
+-- installs portable (no named roles required) while preserving the
+-- intended lockdown on upgraded databases that already have agent roles.
 DO $$
 DECLARE
-    v_roles CONSTANT text[] := ARRAY[
-        'argus','athena','coder','conductor','erato','flint','gem','gidget',
-        'graybeard','hermes','iris','marcie','nova','quill','scout','scribe',
-        'ticker','victoria'
-    ];
     v_role text;
     v_table text;
-BEGIN
-    FOREACH v_table IN ARRAY ARRAY[
+    v_control_tables text[] := ARRAY[
         'agent_chat_error_templates',
+        'agent_chat_breaker_config',
         'agent_chat_breaker_state',
+        'agent_chat_breaker_alerts',
+        'agent_chat_mutes',
         'agent_chat_suppressed_log'
-    ]
+    ];
+BEGIN
+    FOR v_role IN
+        -- Use grantee (sql_identifier text) directly; %I quotes once below.
+        -- grantee::regrole::text would already quote identifiers and must not
+        -- be passed to %I, or names like "nova-staging" get double-quoted.
+        SELECT DISTINCT grantee
+        FROM information_schema.role_table_grants
+        WHERE table_schema = 'public'
+          AND table_name = 'agent_chat'
+          AND privilege_type = 'SELECT'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
+        UNION
+        SELECT DISTINCT grantee
+        FROM information_schema.role_routine_grants
+        WHERE routine_schema = 'public'
+          AND routine_name = 'send_agent_message'
+          AND privilege_type = 'EXECUTE'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
     LOOP
-        FOREACH v_role IN ARRAY v_roles
+        -- Skip system/owner roles: the table owner must keep inherent
+        -- privileges so migrations (which may INSERT into control tables)
+        -- can run in non-superuser dev/test environments.
+        IF v_role = session_user OR v_role = 'postgres' THEN
+            CONTINUE;
+        END IF;
+        FOREACH v_table IN ARRAY v_control_tables
         LOOP
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-                EXECUTE format(
-                    'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
-                    v_table, v_role
-                );
-                EXECUTE format(
-                    'GRANT SELECT ON TABLE public.%I TO %I',
-                    v_table, v_role
-                );
-            END IF;
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
+                v_table, v_role
+            );
+            EXECUTE format(
+                'GRANT SELECT ON TABLE public.%I TO %I',
+                v_table, v_role
+            );
         END LOOP;
     END LOOP;
 END $$;
@@ -913,5 +1143,9 @@ BEGIN
         ON ddl_command_end
         EXECUTE FUNCTION public.notify_schema_change();
 EXCEPTION WHEN insufficient_privilege THEN
-    RAISE NOTICE 'Skipping schema_change_trigger creation: current user is not a superuser';
+    IF coalesce(current_setting('agent_chat.devtest', true),'') = 'on' THEN
+        RAISE NOTICE 'Skipping schema_change_trigger creation: current user is not a superuser';
+    ELSE
+        RAISE;
+    END IF;
 END $$;

@@ -527,39 +527,52 @@ END $$;
 -- ─── Lock down direct writes on the new control tables ─────────────────────
 -- schema.sql's `ALTER DEFAULT PRIVILEGES FOR ROLE postgres ... GRANT DELETE,
 -- INSERT, SELECT, UPDATE ON TABLES` applies to any new table postgres
--- creates, including these three. Revoke write access from the standard
--- agent role list so send_agent_message() (SECURITY DEFINER, owned by
--- postgres) remains the only write path -- consistent with the existing
--- agent_chat/agent_chat_processed invariant. SELECT is preserved for
--- diagnosability per the "loud in the log" constraint.
+-- agent-chat#39: discover roles that already have bus access instead of
+-- hardcoding a roster. Revoke write access so send_agent_message()
+-- (SECURITY DEFINER, owned by postgres) remains the only write path --
+-- consistent with the existing agent_chat/agent_chat_processed invariant.
+-- SELECT is preserved for diagnosability per the "loud in the log" constraint.
 DO $$
 DECLARE
-    v_roles CONSTANT text[] := ARRAY[
-        'argus','athena','coder','conductor','erato','flint','gem','gidget',
-        'graybeard','hermes','iris','marcie','nova','quill','scout','scribe',
-        'ticker','victoria'
-    ];
     v_role text;
     v_table text;
 BEGIN
-    FOREACH v_table IN ARRAY ARRAY[
-        'agent_chat_error_templates',
-        'agent_chat_breaker_state',
-        'agent_chat_suppressed_log'
-    ]
+    FOR v_role IN
+        -- grantee is sql_identifier text; %I below quotes exactly once.
+        SELECT DISTINCT grantee
+        FROM information_schema.role_table_grants
+        WHERE table_schema = 'public'
+          AND table_name = 'agent_chat'
+          AND privilege_type = 'SELECT'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
+        UNION
+        SELECT DISTINCT grantee
+        FROM information_schema.role_routine_grants
+        WHERE routine_schema = 'public'
+          AND routine_name = 'send_agent_message'
+          AND privilege_type = 'EXECUTE'
+          AND grantee NOT IN ('PUBLIC', 'postgres', session_user)
     LOOP
-        FOREACH v_role IN ARRAY v_roles
+        -- Never revoke from the table owner: the owner must keep its
+        -- inherent privileges so migrations can run in non-superuser
+        -- dev/test environments. In production the owner is postgres.
+        IF v_role = session_user OR v_role = 'postgres' THEN
+            CONTINUE;
+        END IF;
+        FOREACH v_table IN ARRAY ARRAY[
+            'agent_chat_error_templates',
+            'agent_chat_breaker_state',
+            'agent_chat_suppressed_log'
+        ]
         LOOP
-            IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = v_role) THEN
-                EXECUTE format(
-                    'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
-                    v_table, v_role
-                );
-                EXECUTE format(
-                    'GRANT SELECT ON TABLE public.%I TO %I',
-                    v_table, v_role
-                );
-            END IF;
+            EXECUTE format(
+                'REVOKE INSERT, UPDATE, DELETE ON TABLE public.%I FROM %I',
+                v_table, v_role
+            );
+            EXECUTE format(
+                'GRANT SELECT ON TABLE public.%I TO %I',
+                v_table, v_role
+            );
         END LOOP;
     END LOOP;
 END $$;
