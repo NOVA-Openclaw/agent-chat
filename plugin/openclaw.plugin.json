@@ -34,9 +34,9 @@
             "type": "integer",
             "description": "Keep-alive poll interval in ms"
           },
-          "routeToSession": {
+          "agentId": {
             "type": "string",
-            "description": "Route messages to a specific session instead of creating unique sessions per message"
+            "description": "OpenClaw gateway agent id that owns agent_chat sessions (overrides sole/default agent resolution)"
           }
         }
       }
@@ -70,10 +70,17 @@
         "type": "integer",
         "description": "Keep-alive poll interval in ms"
       },
-      "routeToSession": {
+      "agentId": {
         "type": "string",
-        "description": "Route messages to a specific session instead of creating unique sessions per message"
+        "description": "OpenClaw gateway agent id that owns agent_chat sessions (overrides sole/default agent resolution)"
       }
     }
+  },
+  "contracts": {
+    "tools": [
+      "agent_chat_send",
+      "agent_chat_mark",
+      "agent_chat_mute"
+    ]
   }
 }

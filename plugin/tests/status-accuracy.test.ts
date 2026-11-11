@@ -172,16 +172,20 @@ function findFailedUpdate(queries: Array<{ sql: string; params: unknown[] }>, ch
   );
 }
 
-describe("TC-23-033: deliver fired → responded", () => {
-  it("marks message responded when deliver() was invoked", async () => {
+describe("A11/TC-23-033 retired: deliver fired does not auto-send or mark responded", () => {
+  it("logs/suppresses deliver() and leaves status routed", async () => {
     const runtime = makeBaseRuntime();
+    let deliverPayload: { text?: string } | null = null;
     (runtime.channel!.reply as Record<string, unknown>).createReplyDispatcherWithTyping =
       ({ deliver }: Record<string, unknown>) => {
+        const deliverFn = deliver as (payload: { text: string }) => Promise<void>;
         return {
           dispatcher: {
             waitForIdle: async () => {
               // Simulate the runtime invoking deliver() during the turn.
-              await (deliver as (payload: { text: string }) => Promise<void>)({ text: "reply" });
+              const payload = { text: "reply" };
+              deliverPayload = payload;
+              await deliverFn(payload);
             },
           },
           replyOptions: {},
@@ -196,25 +200,34 @@ describe("TC-23-033: deliver fired → responded", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
 
     assert.ok(findRoutedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected routed update");
     assert.ok(
-      findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
-      "expected responded update",
+      !findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
+      "did not expect responded update",
     );
     assert.ok(
       !findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
       "did not expect handled update",
     );
+
+    // No outbound insert should have happened via deliver().
+    const sendQuery = fakeClient.queries.find((q) =>
+      q.sql.trim().toLowerCase().startsWith("select send_agent_message"),
+    );
+    assert.ok(!sendQuery, "deliver() should not insert an outbound message");
+    assert.ok(deliverPayload, "deliver callback should have been invoked");
   });
 });
 
-describe("TC-23-034: no reply → handled (NEW build, undefined deferred)", () => {
-  it("marks message handled when deliver never fired and turn is not deferred", async () => {
+describe("A12/TC-23-034 retired: no reply leaves message routed", () => {
+  it("does not auto-mark handled; status stays routed", async () => {
     const runtime = makeBaseRuntime();
     setAgentChatRuntime(runtime);
 
@@ -224,13 +237,18 @@ describe("TC-23-034: no reply → handled (NEW build, undefined deferred)", () =
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
 
     assert.ok(findRoutedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected routed update");
-    assert.ok(findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected handled update");
+    assert.ok(
+      !findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
+      "did not expect handled update",
+    );
     assert.ok(
       !findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
       "did not expect responded update",
@@ -258,7 +276,9 @@ describe("TC-23-035/036: deferred turn stays routed", () => {
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });
@@ -276,8 +296,8 @@ describe("TC-23-035/036: deferred turn stays routed", () => {
   }
 });
 
-describe("TC-23-037: OLD build ambiguous with linked reply → responded", () => {
-  it("uses DB-linked reply as tiebreaker and marks responded", async () => {
+describe("A13/TC-23-037 retired: linked reply does not auto-mark responded", () => {
+  it("leaves status routed even when a DB-linked reply exists", async () => {
     const runtime = makeBaseRuntime();
     setAgentChatRuntime(runtime);
 
@@ -287,15 +307,17 @@ describe("TC-23-037: OLD build ambiguous with linked reply → responded", () =>
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
 
     assert.ok(findRoutedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected routed update");
     assert.ok(
-      findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
-      "expected responded update",
+      !findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
+      "did not expect responded update",
     );
     assert.ok(
       !findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
@@ -304,8 +326,8 @@ describe("TC-23-037: OLD build ambiguous with linked reply → responded", () =>
   });
 });
 
-describe("TC-23-038: OLD build ambiguous without linked reply → handled", () => {
-  it("marks handled when no linked reply exists", async () => {
+describe("A10/TC-23-038 retired: no linked reply leaves message routed", () => {
+  it("does not auto-mark handled when no linked reply exists", async () => {
     const runtime = makeBaseRuntime();
     setAgentChatRuntime(runtime);
 
@@ -315,13 +337,18 @@ describe("TC-23-038: OLD build ambiguous without linked reply → handled", () =
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
 
     assert.ok(findRoutedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected routed update");
-    assert.ok(findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id), "expected handled update");
+    assert.ok(
+      !findHandledUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
+      "did not expect handled update",
+    );
     assert.ok(
       !findRespondedUpdate(fakeClient.queries, SAMPLE_MESSAGE.id),
       "did not expect responded update",
@@ -344,7 +371,9 @@ describe("TC-23-041: replay regression — already-responded rows are never re-d
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -392,14 +421,18 @@ describe("TC-23-112: only the claim winner dispatches", () => {
       processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       }),
       processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       }),
@@ -423,7 +456,9 @@ describe("TC-23-113: claimed-then-failed still marks failed", () => {
     await processAgentChatMessage({
       message: SAMPLE_MESSAGE,
       client: fakeClient as unknown as import("pg").Client,
-      agentName: "newhart",
+      dbUser: "newhart",
+
+      gatewayAgentId: "newhart",
       cfg: fakeCtx.cfg,
       ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
     });
@@ -451,7 +486,9 @@ describe("TC-23-115: no duplicate dispatch regardless of implementation mechanis
       await processAgentChatMessage({
         message: SAMPLE_MESSAGE,
         client: fakeClient as unknown as import("pg").Client,
-        agentName: "newhart",
+        dbUser: "newhart",
+
+        gatewayAgentId: "newhart",
         cfg: fakeCtx.cfg,
         ctx: fakeCtx as unknown as Parameters<typeof processAgentChatMessage>[0]["ctx"],
       });

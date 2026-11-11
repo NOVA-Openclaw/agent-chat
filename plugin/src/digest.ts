@@ -190,12 +190,19 @@ export function buildDigestText(options: {
     lines.push("");
   }
 
-  lines.push("How to triage:");
+  lines.push("How to triage (use the agent_chat tools, not raw SQL):");
   lines.push(
-    "- Reply: use send_agent_message(sender, message, recipients, p_reply_to => <id>)",
+    "- Reply: agent_chat_send({to:'<sender>', text, replyTo:<id>})",
   );
-  lines.push("- Mark handled: SELECT mark_agent_chat_status(ARRAY[<id>], 'handled');");
-  lines.push("- Mark expired: SELECT mark_agent_chat_status(ARRAY[<id>], 'expired');");
+  lines.push(
+    "- Mark handled: agent_chat_mark({ids:[<id>], status:'handled'})",
+  );
+  lines.push(
+    "- Mark skipped: agent_chat_mark({ids:[<id>], status:'skipped'})",
+  );
+  lines.push(
+    "- Loop? Pause the peer: agent_chat_mute({peer:'<sender>', minutes, reason})",
+  );
   lines.push(
     "- Keep statuses current during normal operation so digests stay small.",
   );
@@ -235,14 +242,12 @@ export async function deliverDigest(options: {
 
   const replyApi = runtime.channel!.reply;
   const sessionLabel = `agent:${agentName}:agent_chat`;
-  const agentChatTo = `agent_chat:${agentName}`;
 
   const ctxPayload = replyApi.finalizeInboundContext({
     Body: digestText,
     RawBody: digestText,
     CommandBody: digestText,
     From: "agent_chat",
-    To: agentChatTo,
     SessionKey: sessionLabel,
     ChatType: "direct",
     ConversationLabel: "agent_chat",
@@ -253,7 +258,8 @@ export async function deliverDigest(options: {
     MessageSid: `digest-${Date.now()}`,
     Timestamp: Date.now(),
     OriginatingChannel: "agent_chat",
-    OriginatingTo: agentChatTo,
+    // Intentionally NO OriginatingTo: the digest is a wake, not a routable
+    // conversation, so subagent/cron/heartbeat announces cannot reach agent_chat.
   });
 
   const { dispatcher, replyOptions } = replyApi.createReplyDispatcherWithTyping({
@@ -285,7 +291,8 @@ const firedByRuntime = new WeakMap<object, boolean>();
 /** Options for creating the startup digest service. */
 export interface StartupDigestServiceOptions {
   runtime: PluginRuntime;
-  resolveAgentName: () => string;
+  resolveDbUser: () => string;
+  resolveGatewayAgentId: (cfg?: OpenClawConfig) => string;
   createClient: () => pg.Client;
 }
 
@@ -300,7 +307,7 @@ export interface StartupDigestServiceOptions {
 export function createStartupDigestService(
   options: StartupDigestServiceOptions,
 ): OpenClawPluginService {
-  const { runtime, resolveAgentName, createClient } = options;
+  const { runtime, resolveDbUser, resolveGatewayAgentId, createClient } = options;
   let fired = false;
 
   return {
@@ -317,10 +324,11 @@ export function createStartupDigestService(
       firedByRuntime.set(runtime, true);
       fired = true;
 
-      const agentName = resolveAgentName();
-      if (!agentName) {
+      const dbUser = resolveDbUser();
+      const gatewayAgentId = resolveGatewayAgentId(ctx.config);
+      if (!dbUser || !gatewayAgentId) {
         ctx.logger.error?.(
-          "agent_chat: cannot run startup digest — no agent name could be resolved from pgConfig.user",
+          "agent_chat: cannot run startup digest — no DB user or gateway agent id could be resolved",
         );
         return;
       }
@@ -334,15 +342,15 @@ export function createStartupDigestService(
       const client = createClient();
       try {
         await client.connect();
-        const total = await countUnresolvedMessages(client, agentName);
+        const total = await countUnresolvedMessages(client, dbUser);
         if (total === 0) {
           ctx.logger.debug?.("agent_chat: no unresolved messages; skipping digest");
           return;
         }
 
-        const messages = await fetchUnresolvedMessages(client, agentName, DIGEST_CAP);
-        const digestText = buildDigestText({ agentName, messages, totalUnresolved: total });
-        await deliverDigest({ runtime, cfg: ctx.config, agentName, digestText, log: ctx.logger });
+        const messages = await fetchUnresolvedMessages(client, dbUser, DIGEST_CAP);
+        const digestText = buildDigestText({ agentName: dbUser, messages, totalUnresolved: total });
+        await deliverDigest({ runtime, cfg: ctx.config, agentName: gatewayAgentId, digestText, log: ctx.logger });
       } catch (err) {
         ctx.logger.error?.(`agent_chat startup digest failed: ${err}`);
       } finally {

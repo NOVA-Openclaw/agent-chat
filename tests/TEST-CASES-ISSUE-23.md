@@ -6,6 +6,30 @@ the Step 2 approved plan (issue #23, comments through "Step 2: plan checked
 against OpenClaw docs and source"). Source pinned at commit
 `344c313dccc96c0ef7c62eb49d7b485b86f314fa`, branch `fix/23-openclaw-2026-9-compat`.
 
+> **Staleness notice (added SE#1453, agent-chat#34/#36/#39, 2026-11-11):**
+> Requirement 4 below (`TC-23-033` through `TC-23-038`, dispatch-status
+> auto-detection — "`deliver()` fired ⇒ mark `responded`", "no reply but the
+> turn genuinely finished ⇒ mark `handled`", "`deferredToActiveRun` ⇒ stays
+> `routed`") describes a design that **agent-chat#36 ("no auto-reply")
+> superseded**. The current `processAgentChatMessage()` always marks a
+> successfully-dispatched message `routed`, full stop; `handled`/`skipped`/
+> `responded` are now reached only via an explicit `agent_chat_mark` or
+> `agent_chat_send({ replyTo })` tool call from the woken turn, because the
+> dispatcher no longer inspects `deliver()` invocation or
+> `deferredToActiveRun` at all. The real regression suite
+> (`plugin/tests/status-accuracy.test.ts`) explicitly labels the matching
+> cases **"retired"** — see `A11`/`TC-23-033` ("retired: deliver fired does
+> not auto-send or mark responded") and `A13`/`TC-23-037` ("retired: linked
+> reply does not auto-mark responded"). Requirements 1, 2, 3, 5, 6, 7, and 8
+> below are unaffected by agent-chat#34/#36/#39 and remain an accurate record
+> of issue #23's shipped design. **Recommendation:** archive this file (e.g.
+> move it under an `archive/` or `tests/historical/` directory) in a future
+> housekeeping pass rather than editing it in place — it is a point-in-time
+> SE#1068 test-design record, and only Requirement 4 needs the correction
+> above; the rest has lasting historical value and shouldn't be rewritten to
+> read as if it always described current behavior.
+
+
 OpenClaw builds under test:
 - **OLD** = `/home/nova/nova-openclaw-production` @ `436c9a3` (v2026.7.1-600) — still running on Victoria, Graybeard, NOVA.
 - **NEW** = `/home/nova/nova-openclaw-production` @ `d6c4379` (v2026.9.6-20).

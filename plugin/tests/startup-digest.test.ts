@@ -127,12 +127,14 @@ function makeFakeApi(options: {
   api: OpenClawPluginApi;
   services: unknown[];
   channels: unknown[];
+  tools: unknown[];
   logs: ReturnType<typeof makeLogger>["lines"];
 } {
   const runtime = options.runtime ?? makeBaseRuntime();
   const logger = makeLogger();
   const services: unknown[] = [];
   const channels: unknown[] = [];
+  const tools: unknown[] = [];
 
   const api = {
     id: "agent_chat",
@@ -144,9 +146,10 @@ function makeFakeApi(options: {
     registrationMode: options.registrationMode ?? "full",
     registerChannel: (reg: unknown) => channels.push(reg),
     registerService: (svc: unknown) => services.push(svc),
+    registerTool: (tool: unknown, opts?: unknown) => tools.push({ tool, opts }),
   } as unknown as OpenClawPluginApi;
 
-  return { api, services, channels, logs: logger.lines };
+  return { api, services, channels, tools, logs: logger.lines };
 }
 
 function makeServiceCtx(): {
@@ -197,7 +200,8 @@ describe("TC-23-051: full mode registers and runs digest", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime: api.runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -225,7 +229,8 @@ describe("TC-23-052: start() fires exactly once when called twice", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -248,7 +253,8 @@ describe("TC-23-053: stop() resets guard so a second start() fires", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)] });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -291,12 +297,14 @@ describe("TC-23-055: duplicate hooks on hot reload fire digest once", () => {
 
     const serviceA = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
     const serviceB = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
 
@@ -318,7 +326,8 @@ describe("TC-23-056: empty backlog sends no digest", () => {
     const client = makeFakeClient({ unresolved: [], total: 0 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -342,7 +351,8 @@ describe("TC-23-057: cap boundary 19 — no remaining line", () => {
     const client = makeFakeClient({ unresolved: rows, total: 19 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -368,7 +378,8 @@ describe("TC-23-058: cap boundary 20 — remaining line omitted entirely", () =>
     const client = makeFakeClient({ unresolved: rows, total: 20 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -396,7 +407,8 @@ describe("TC-23-059: cap boundary 21 — 20 oldest + remaining line + paging que
     const client = makeFakeClient({ unresolved: rows, total: 21 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -429,7 +441,8 @@ describe("TC-23-060: overflow persistence / no starvation", () => {
 
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient,
     });
 
@@ -462,7 +475,8 @@ describe("TC-23-062: grouped by sender with previews", () => {
     const client = makeFakeClient({ unresolved: rows, total: 4 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
@@ -479,7 +493,7 @@ describe("TC-23-062: grouped by sender with previews", () => {
 });
 
 describe("TC-23-063: instructions present", () => {
-  it("includes reply, mark-handled, mark-expired, and status-maintenance instructions", async () => {
+  it("includes agent_chat_send, agent_chat_mark, and agent_chat_mute instructions", async () => {
     let body = "";
     const runtime = makeBaseRuntime();
     (runtime.channel!.reply as Record<string, unknown>).dispatchReplyFromConfig = async (args: {
@@ -491,16 +505,20 @@ describe("TC-23-063: instructions present", () => {
     const client = makeFakeClient({ unresolved: [unresolvedRow(1)], total: 1 });
     const service = createStartupDigestService({
       runtime,
-      resolveAgentName: () => "newhart",
+      resolveDbUser: () => "newhart",
+      resolveGatewayAgentId: () => "newhart",
       createClient: () => client as unknown as import("pg").Client,
     });
 
     await service.start(makeServiceCtx() as never);
 
-    assert.match(body, /send_agent_message.*p_reply_to/i);
-    assert.match(body, /mark_agent_chat_status.*handled/i);
-    assert.match(body, /mark_agent_chat_status.*expired/i);
+    assert.match(body, /agent_chat_send.*replyTo/i);
+    assert.match(body, /agent_chat_mark.*handled/i);
+    assert.match(body, /agent_chat_mark.*skipped/i);
+    assert.match(body, /agent_chat_mute/i);
     assert.match(body, /keep statuses current/i);
+    assert.doesNotMatch(body, /send_agent_message.*p_reply_to/i);
+    assert.doesNotMatch(body, /SELECT mark_agent_chat_status/i);
   });
 });
 

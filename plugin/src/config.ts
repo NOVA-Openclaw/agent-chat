@@ -11,6 +11,7 @@ export const AgentChatAccountSchemaBase = z
   .object({
     name: z.string().optional(),
     enabled: z.boolean().optional(),
+    agentId: z.string().optional(),
     pollIntervalMs: z.number().int().positive().optional().default(1000),
   })
   .strict();
@@ -21,6 +22,7 @@ export const AgentChatAccountSchema = AgentChatAccountSchemaBase;
 const AgentChatFullSchema = z.object({
   name: z.string().optional(),
   enabled: z.boolean().optional(),
+  agentId: z.string().optional(),
   pollIntervalMs: z.number().int().positive().optional().default(1000),
   accounts: z.record(z.string(), AgentChatAccountSchema.optional()).optional(),
 }).passthrough();
@@ -32,6 +34,7 @@ export const AgentChatConfigSchema: ChannelConfigSchema = {
     properties: {
       name: { type: "string" },
       enabled: { type: "boolean" },
+      agentId: { type: "string" },
       pollIntervalMs: { type: "integer", default: 1000 },
       accounts: {
         type: "object",
@@ -40,6 +43,7 @@ export const AgentChatConfigSchema: ChannelConfigSchema = {
           properties: {
             name: { type: "string" },
             enabled: { type: "boolean" },
+            agentId: { type: "string" },
             pollIntervalMs: { type: "integer" },
           },
         },

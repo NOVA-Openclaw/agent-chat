@@ -1,8 +1,13 @@
 /**
- * Unit tests for Requirement 2: agent name derived from pgConfig.user,
- * never from cfg.agents.list / default / "main".
+ * Unit tests for agent identity resolution.
  *
- * TC-23-011 through TC-23-017 plus cross-cutting TC-23-120.
+ * The plugin keeps two identities separate:
+ *   - DB user: the PostgreSQL role used for send_agent_message() provenance
+ *     and processed-row ownership.
+ *   - Gateway agent id: the OpenClaw agent id that owns dispatched sessions.
+ *
+ * TC-23-011 through TC-23-017 covered the legacy pgConfig.user resolver.
+ * TC-24-001 through TC-24-006 cover the new gateway-agent-id resolution.
  */
 
 import { describe, it, before, after } from "node:test";
@@ -12,7 +17,8 @@ import os from "node:os";
 import path from "node:path";
 import type { OpenClawConfig } from "openclaw/plugin-sdk";
 import {
-  resolveAgentName,
+  resolveDbUser,
+  resolveGatewayAgentId,
   resolveAgentNameFromPgConfig,
   validateAgentChatConfig,
 } from "../src/channel.js";
@@ -43,59 +49,18 @@ function restorePgEnv(saved: Record<string, string | undefined>) {
   }
 }
 
-describe("TC-23-011: pgConfig.user wins over cfg.agents.list default", () => {
-  it("returns lowercased pgConfig.user and ignores cfg.agents", () => {
-    const cfg: OpenClawConfig = {
-      agents: {
-        list: [{ id: "main", default: true }],
-      },
-    } as unknown as OpenClawConfig;
+// ---------------------------------------------------------------------------
+// DB user resolver (legacy behaviour preserved)
+// ---------------------------------------------------------------------------
 
+describe("TC-23-011: pgConfig.user is the DB user", () => {
+  it("returns lowercased pgConfig.user", () => {
     assert.strictEqual(resolveAgentNameFromPgConfig({ user: "flint" }), "flint");
-    // resolveAgentName uses the module-scoped pgConfig loaded at import time,
-    // so its exact return value depends on the test environment. The important
-    // invariant is that it never consults cfg.agents.
-    assert.doesNotThrow(() => resolveAgentName(cfg));
+    assert.strictEqual(resolveDbUser(), resolveAgentNameFromPgConfig({ user: os.userInfo().username }));
   });
 });
 
-describe("TC-23-012: regression guard for missing .default entries", () => {
-  it("returns newhart even when cfg.agents.list has no default marker", () => {
-    const cfg: OpenClawConfig = {
-      agents: {
-        list: [{ id: "main" }, { id: "newhart" }],
-      },
-    } as unknown as OpenClawConfig;
-
-    assert.strictEqual(resolveAgentNameFromPgConfig({ user: "newhart" }), "newhart");
-    // resolveAgentName is pgConfig-driven; cfg.agents is ignored entirely.
-    assert.doesNotThrow(() => resolveAgentName(cfg));
-  });
-});
-
-describe("TC-23-013: missing cfg.agents does not throw", () => {
-  it("returns pgConfig.user when cfg.agents is undefined", () => {
-    const cfg: OpenClawConfig = {} as OpenClawConfig;
-
-    assert.strictEqual(resolveAgentNameFromPgConfig({ user: "gem" }), "gem");
-    assert.doesNotThrow(() => resolveAgentName(cfg));
-  });
-});
-
-describe("TC-23-014: no usable agent name fails loudly", () => {
-  it("validateAgentChatConfig returns an error when pgConfig.user is absent", () => {
-    const result = validateAgentChatConfig();
-    if (result.ok) {
-      // If a real postgres.json / env provided a user in this test runner,
-      // the direct module-level pgConfig may be populated. The helper itself
-      // is exercised via the empty-pgConfig path below.
-      assert.ok(result.agentName);
-      return;
-    }
-    assert.match(result.error, /no agent name could be resolved/);
-    assert.match(result.error, /pgConfig\.user/);
-  });
-
+describe("TC-23-014: no usable DB user fails loudly", () => {
   it("resolveAgentNameFromPgConfig returns empty string for empty user", () => {
     assert.strictEqual(resolveAgentNameFromPgConfig({ user: "" }), "");
     assert.strictEqual(resolveAgentNameFromPgConfig({}), "");
@@ -123,34 +88,127 @@ describe("TC-23-015: loadPgEnv String coercion behavior is documented", () => {
   });
 });
 
-describe("TC-23-016: fixed resolver reproduces bug and fix against real config loader shape", () => {
-  it("old cfg.agents.list resolver would return 'main' when no default marker", () => {
-    // Simulates the buggy pre-fix logic directly to document the regression.
-    const cfg: OpenClawConfig = {
-      agents: {
-        list: [
-          { id: "main" },
-          { id: "newhart" },
-          { id: "iris" },
-        ],
-      },
-    } as unknown as OpenClawConfig;
-
-    const oldResolver = (c: OpenClawConfig) => {
-      const agents = c.agents?.list ?? [];
-      const defaultAgent = agents.find((a) => a.default) ?? agents[0];
-      return defaultAgent?.id ?? defaultAgent?.name ?? "main";
-    };
-
-    assert.strictEqual(oldResolver(cfg), "main");
-    assert.strictEqual(resolveAgentNameFromPgConfig({ user: "newhart" }), "newhart");
-  });
-});
-
 describe("TC-23-017: resolver is generic, not hardcoded", () => {
   it("returns distinct names for iris and victoria", () => {
     assert.strictEqual(resolveAgentNameFromPgConfig({ user: "iris" }), "iris");
     assert.strictEqual(resolveAgentNameFromPgConfig({ user: "victoria" }), "victoria");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Gateway agent id resolver
+// ---------------------------------------------------------------------------
+
+describe("TC-24-001: explicit channels.agent_chat.agentId wins", () => {
+  it("uses the explicit channel agentId and ignores cfg.agents", () => {
+    const cfg: OpenClawConfig = {
+      channels: {
+        agent_chat: {
+          agentId: "main",
+        },
+      },
+      agents: {
+        list: [{ id: "nova" }],
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), "main");
+  });
+});
+
+describe("TC-24-002: sole agents.entries entry is the gateway id", () => {
+  it("returns the only configured agent entry", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        entries: {
+          main: {},
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), "main");
+  });
+});
+
+describe("TC-24-003: default marker in agents.entries wins", () => {
+  it("returns the entry marked default", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        entries: {
+          nova: {},
+          main: { default: true },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), "main");
+  });
+});
+
+describe("TC-24-004: sole agents.list entry is the gateway id", () => {
+  it("returns the only agent in the list", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        list: [{ id: "main" }],
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), "main");
+  });
+});
+
+describe("TC-24-005: default marker in agents.list wins", () => {
+  it("returns the list entry marked default", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        list: [{ id: "nova" }, { id: "main", default: true }],
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), "main");
+  });
+});
+
+describe("TC-24-006: falls back to DB user when cfg provides no agent id", () => {
+  it("falls back to the DB user for backward compatibility", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        list: [],
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg), resolveDbUser());
+  });
+});
+
+describe("TC-24-007: per-account agentId is respected", () => {
+  it("uses channels.agent_chat.accounts.<id>.agentId", () => {
+    const cfg: OpenClawConfig = {
+      channels: {
+        agent_chat: {
+          accounts: {
+            staging: { agentId: "main" },
+          },
+        },
+      },
+    } as unknown as OpenClawConfig;
+
+    assert.strictEqual(resolveGatewayAgentId(cfg, "staging"), "main");
+  });
+});
+
+describe("TC-24-008: validateAgentChatConfig requires both identities", () => {
+  it("returns an error when no gateway agent id can be resolved", () => {
+    const cfg: OpenClawConfig = {
+      agents: {
+        list: [],
+      },
+    } as unknown as OpenClawConfig;
+
+    const result = validateAgentChatConfig(cfg);
+    if (!result.ok) {
+      assert.match(result.error, /gateway agent id/);
+    }
   });
 });
 
