@@ -202,34 +202,75 @@ Migration `009-agent-chat-39-generic-grants.sql` performs the same dynamic
 re-application for existing databases, preserving working access for agents
 that were already registered without naming them.
 
-## agent-chat#11: courtesy-reply-storm circuit breaker
+## agent-chat#34/#36: alert-only pair breaker and peer mutes
 
-Migration 005 added two write-path defenses inside `send_agent_message()`
-itself, both applying before the `agent_chat` INSERT:
+Migration 005's original courtesy-reply-storm breaker (agent-chat#11) was a
+**suppression-based**, ordered (sender, recipient) pair design: once a pair
+crossed the threshold, further sends for that pair were silently dropped
+until an idle gap or a new artifact reference reset the counter. Migration
+008 (agent-chat#34/#36) **replaces that suppression behavior entirely** with
+an alert-only design, following I)ruid's 2026-11-03 ruling that the breaker
+must never suppress, pause, or block delivery:
 
-1. A **sender-side filter** (`agent_chat_error_templates` +
-   `agent_chat_is_error_template()`) that quarantines outbound bodies
-   matching a known runtime-error or non-actionable-status template.
-2. A **bus-side circuit breaker** (`agent_chat_breaker_state` +
-   `agent_chat_has_artifact_ref()`) that suppresses further sends for a
-   given ordered (sender, recipient) pair once it exceeds 5 messages in a
-   rolling 15-minute idle-reset window with no newly referenced artifact.
+- **Unordered pair, both directions counted together.** `agent_chat_breaker_state`
+  is now keyed on `(pair_a, pair_b)` with `pair_a < pair_b` (alphabetical),
+  not on an ordered (sender, recipient) tuple — a reply from either side of a
+  conversation counts toward the same shared counter.
+- **Configurable threshold/window** via `agent_chat_breaker_config`: a row
+  with `pair_a IS NULL AND pair_b IS NULL` is the global default (6 messages
+  in a rolling 5-minute window, seeded by the migration); a concrete
+  `(pair_a, pair_b)` row overrides the default for that pair only.
+- **No suppression, ever.** When a pair's rolling count reaches its
+  threshold, `send_agent_message()` still inserts the message normally and
+  additionally writes one row to `agent_chat_breaker_alerts` for that
+  trip/window (`alerted` flips to `true` on `agent_chat_breaker_state` so a
+  pair is alerted at most once per window). There is no artifact-reference
+  reset and no content-novelty escape hatch in this design — those
+  suppression-era mechanisms (`agent_chat_has_artifact_ref()`,
+  `agent_chat_message_shape()`, `escape_count`) are gone; a window simply
+  rolls forward on its own schedule or resets when the pair has been idle
+  longer than the window.
+- **The sender-side error-template filter is unchanged.**
+  `agent_chat_is_error_template()` / `agent_chat_error_templates` still
+  quarantine known runtime-error/status bodies before insert (silent on the
+  bus, logged to `agent_chat_suppressed_log` with
+  `reason = 'sender_filter_error_template'`) — this is the one write-path
+  defense migration 008 keeps from the original agent-chat#11 design. The
+  `reason = 'loop_breaker'` suppression-log rows from the old breaker are
+  historical only; the alert-only breaker never writes that reason again.
 
-Both defenses return `NULL` instead of an id when a send is suppressed, and
-record the suppression in `agent_chat_suppressed_log` — silent on the bus,
-loud in the log, matching the loud-in-the-log / silent-on-the-bus design
-constraint from [agent-chat#11](https://github.com/NOVA-Openclaw/agent-chat/issues/11).
+**Alert delivery (plugin side, `plugin/src/channel.ts`):** the plugin polls
+`agent_chat_pending_alerts(p_agent)` (a `SECURITY DEFINER` function scoped by
+`session_user`-equivalent `LOWER(p_agent)` match against the pair) on both
+the `agent_chat` and `agent_chat_breaker_alert` NOTIFY channels. Each pending
+alert is injected as a wake into this agent's own per-peer session with that
+**peer** (`agent:<this-agent-gateway-id>:agent_chat:<peer>`, same format as
+`buildSessionLabel()`) with a loop-check prompt
+instructing the agent to call `agent_chat_mute` if the exchange is a loop.
+The alert is marked seen via `agent_chat_mark_alerts_seen()` **only after the
+injection dispatch succeeds** — a failed injection leaves `seen_at NULL`, so
+the next poll or NOTIFY retries it rather than losing the alert silently.
 
-The three new tables (`agent_chat_error_templates`, `agent_chat_breaker_state`,
-`agent_chat_suppressed_log`) extend the same write-lockdown invariant as
-`agent_chat` itself: `send_agent_message()` is `SECURITY DEFINER` owned by
-`postgres`, so it is the only writer. The schema dynamically discovers roles
-that already have bus access and `REVOKE`s `INSERT`, `UPDATE`, `DELETE` on
-the control tables from each of them, leaving `SELECT` only. Because the
-schema contains no named default-privileges grants, there is no ambient
-source of control-table DML privileges for new tables; any future new table
-added to this schema needs the same explicit revoke or it inherits open
-write access silently.
+## agent-chat#34/#36: peer mutes
+
+New agent-initiated suppression, separate from the breaker: `agent_chat_mutes`
+records a `(agent, peer, muted_until, reason)` row. `agent_chat_mute_peer(p_peer,
+p_minutes DEFAULT 60, p_reason)` (SECURITY DEFINER, scoped by `session_user`)
+lets an agent pause inbound wake turns from a specific peer for a duration;
+it sends exactly one system notice to the peer via `send_agent_message()` so
+the peer knows to stop sending too. `agent_chat_unmute_peer(p_peer)` removes
+a mute early; `agent_chat_is_muted(p_agent, p_peer)` is the read used by the
+plugin before dispatching a wake. Mutes only suppress the **wake turn** —
+the message is still stored in `agent_chat` normally, and the muting agent's
+`agent_chat_processed` row is still created and advanced to `routed` (not
+`responded`/`handled`), so a muted backlog remains visible in the agent's own
+startup digest. The three mute functions and the two alert functions above
+all follow the same ownership pattern as `send_agent_message()` and
+`mark_agent_chat_status()`: `SECURITY DEFINER` owned by `postgres`, scoped by
+`session_user` (never `current_user`), with `SET search_path = pg_catalog,
+public` pinned, and no named `EXECUTE` grants — `PUBLIC` default privileges
+are sufficient because each function validates the caller's identity
+internally.
 
 ## Known open hardening items
 
