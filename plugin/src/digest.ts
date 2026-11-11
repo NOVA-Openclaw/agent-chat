@@ -5,6 +5,7 @@ import type {
   OpenClawPluginServiceContext,
   PluginRuntime,
 } from "openclaw/plugin-sdk";
+import { dispatchWithReplyLifecycle } from "./dispatch-lifecycle.js";
 
 const DIGEST_CAP = 20;
 
@@ -262,24 +263,27 @@ export async function deliverDigest(options: {
     // conversation, so subagent/cron/heartbeat announces cannot reach agent_chat.
   });
 
-  const { dispatcher, replyOptions } = replyApi.createReplyDispatcherWithTyping({
-    deliver: async () => {
-      // The digest itself is not expecting a deliver() reply; the agent is
-      // instructed to use send_agent_message / mark_agent_chat_status.
-    },
-    onError: (err, info) => {
-      log?.error?.(`agent_chat digest reply failed: ${err}`);
-    },
-  });
-
   try {
-    await replyApi.dispatchReplyFromConfig({
-      ctx: ctxPayload,
-      cfg,
-      dispatcher,
-      replyOptions,
+    await dispatchWithReplyLifecycle({
+      runtime,
+      deliver: async () => {
+        // The digest itself is not expecting a deliver() reply; the agent is
+        // instructed to use send_agent_message / mark_agent_chat_status.
+      },
+      onError: (err) => {
+        log?.error?.(`agent_chat digest reply failed: ${err}`);
+      },
+      metadata: { sessionKey: sessionLabel },
+      run: async ({ dispatcher, replyOptions }: { dispatcher: unknown; replyOptions: unknown }) => {
+        await replyApi.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg,
+          dispatcher: dispatcher as any,
+          replyOptions: replyOptions as any,
+        });
+        log?.info?.(`agent_chat digest delivered to ${agentName}`);
+      },
     });
-    log?.info?.(`agent_chat digest delivered to ${agentName}`);
   } catch (err) {
     log?.error?.(`agent_chat digest dispatch failed: ${err}`);
   }
