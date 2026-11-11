@@ -9,6 +9,7 @@ import type {
 import { loadPgEnv } from "../lib/pg-env.js";
 import { getAgentChatRuntime } from "./runtime.js";
 import { AgentChatConfigSchema, type ResolvedAgentChatAccount } from "./config.js";
+import { dispatchWithReplyLifecycle } from "./dispatch-lifecycle.js";
 
 // Resolve agent_chat DB from the nested config section, falling back to flat keys.
 // No process.env pollution so child processes/subagents keep their own env.
@@ -470,16 +471,21 @@ export async function processAgentChatMessage({
       OriginatingTo: agentChatTo,
     });
 
-    // Create reply dispatcher that sends replies back to agent_chat table
+    // Dispatch the message to the agent using dispatchReplyFromConfig.
+    // The lifecycle wrapper creates the reply dispatcher, passes metadata,
+    // and guarantees markComplete()/waitForIdle() so gateway shutdown drains.
+    log?.info?.(`🚀 Dispatching message ${message.id} to agent...`);
+
     let deliverFired = false;
-    const { dispatcher, replyOptions, markDispatchIdle } =
-      runtime.channel.reply.createReplyDispatcherWithTyping({
-        deliver: async (payload, info) => {
+    try {
+      const { dispatchResult } = await dispatchWithReplyLifecycle({
+        runtime,
+        deliver: async (payload, _info) => {
           deliverFired = true;
           try {
             await insertOutboundMessage(client, {
               sender: agentName,
-              message: payload.text || "",
+              message: (payload as { text?: string }).text || "",
               recipients: [message.sender],
               replyTo: message.id,
             });
@@ -512,29 +518,26 @@ export async function processAgentChatMessage({
         onError: (err, info) => {
           log?.error?.(`${info.kind} reply failed: ${err}`);
         },
+        metadata: {
+          sessionKey: ctxPayload.SessionKey,
+          runId: (cfg as { runId?: string }).runId,
+        },
+        run: async ({ dispatcher, replyOptions, markDispatchIdle }) => {
+          const dispatchResult = await runtime.channel.reply.dispatchReplyFromConfig({
+            ctx: ctxPayload,
+            cfg,
+            dispatcher: dispatcher as any,
+            replyOptions: replyOptions as any,
+          });
+
+          markDispatchIdle();
+
+          log?.info?.(`✅ Successfully dispatched message ${message.id}`);
+          await markMessageRouted(client, message.id, agentName);
+
+          return { dispatchResult };
+        },
       });
-
-    // Dispatch the message to the agent using dispatchReplyFromConfig
-    log?.info?.(`🚀 Dispatching message ${message.id} to agent...`);
-
-    try {
-      const dispatchResult = await runtime.channel.reply.dispatchReplyFromConfig({
-        ctx: ctxPayload,
-        cfg,
-        dispatcher,
-        replyOptions,
-      });
-
-      markDispatchIdle();
-
-      log?.info?.(`✅ Successfully dispatched message ${message.id}`);
-      await markMessageRouted(client, message.id, agentName);
-
-      // Wait for any async deliver() work to finish before deciding the final
-      // status. On OLD builds waitForIdle resolves void; on NEW builds it may
-      // resolve a ReplyDispatchReceipt, but the outcome is already reflected
-      // in deliverFired / deferredToActiveRun.
-      await dispatcher.waitForIdle();
 
       if (deliverFired) {
         // deliver() was invoked. It already set the status to responded
