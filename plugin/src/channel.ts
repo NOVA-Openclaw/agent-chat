@@ -9,6 +9,7 @@ import type {
 import { loadPgEnv } from "../lib/pg-env.js";
 import { getAgentChatRuntime } from "./runtime.js";
 import { AgentChatConfigSchema, type ResolvedAgentChatAccount } from "./config.js";
+import { dispatchWithReplyLifecycle } from "./dispatch-lifecycle.js";
 
 // Resolve agent_chat DB from the nested config section, falling back to flat keys.
 // No process.env pollution so child processes/subagents keep their own env.
@@ -587,36 +588,37 @@ export async function injectBreakerAlert(options: {
     // or announce origin.
   });
 
-  const { dispatcher, replyOptions, markDispatchIdle } =
-    runtime.channel.reply.createReplyDispatcherWithTyping({
+  try {
+    await dispatchWithReplyLifecycle({
+      runtime,
       deliver: async (payload, _info) => {
-        const preview = truncateForLog(payload.text ?? "");
+        const preview = truncateForLog((payload as { text?: string }).text ?? "");
         log?.info?.(
           `Suppressing automatic agent_chat reply for breaker alert ${alert.alert_id}: ${preview}`,
         );
       },
       onError: (err, info) => {
-        log?.error?.(`${info.kind} breaker alert reply failed: ${err}`);
+        log?.error?.(`${(info as { kind: string }).kind} breaker alert reply failed: ${err}`);
+      },
+      metadata: { sessionKey: sessionLabel },
+      run: async ({ dispatcher, replyOptions, markDispatchIdle }: { dispatcher: unknown; replyOptions: unknown; markDispatchIdle: () => void }) => {
+        await runtime.channel.reply.dispatchReplyFromConfig({
+          ctx: ctxPayload,
+          cfg,
+          dispatcher: dispatcher as any,
+          replyOptions: replyOptions as any,
+        });
+        markDispatchIdle();
+
+        // Mark the alert seen only after successful injection. A failed dispatch
+        // leaves seen_at NULL so the next poll/notification retries it.
+        await client.query(`SELECT agent_chat_mark_alerts_seen($1::int[])`, [
+          [alert.alert_id],
+        ]);
+
+        log?.info?.(`Breaker alert ${alert.alert_id} injected into session ${sessionLabel}`);
       },
     });
-
-  try {
-    await runtime.channel.reply.dispatchReplyFromConfig({
-      ctx: ctxPayload,
-      cfg,
-      dispatcher,
-      replyOptions,
-    });
-    markDispatchIdle();
-
-    // Mark the alert seen only after successful injection. A failed dispatch
-    // leaves seen_at NULL so the next poll/notification retries it.
-    await client.query(`SELECT agent_chat_mark_alerts_seen($1::int[])`, [
-      [alert.alert_id],
-    ]);
-
-    log?.info?.(`Breaker alert ${alert.alert_id} injected into session ${sessionLabel}`);
-    await dispatcher.waitForIdle();
   } catch (err) {
     log?.error?.(`Failed to inject breaker alert ${alert.alert_id}: ${err}`);
   }
@@ -755,41 +757,41 @@ export async function processAgentChatMessage({
       // a peer through this channel.
     });
 
-    // Create reply dispatcher whose deliver() only logs. No turn output ever
-    // reaches a peer automatically: final text, empty turns, NO_REPLY,
-    // ANNOUNCE_SKIP, fallback summaries, block/tool/media chunks and error
-    // payloads are all dropped after logging a truncated preview.
-    const { dispatcher, replyOptions, markDispatchIdle } =
-      runtime.channel.reply.createReplyDispatcherWithTyping({
+    // Dispatch the message to the agent using dispatchReplyFromConfig.
+    // The lifecycle wrapper creates the reply dispatcher, passes metadata,
+    // and guarantees markComplete()/waitForIdle() so gateway shutdown drains.
+    log?.info?.(`🚀 Dispatching message ${message.id} to agent...`);
+
+    try {
+      await dispatchWithReplyLifecycle({
+        runtime,
         deliver: async (payload, _info) => {
-          const preview = truncateForLog(payload.text ?? "");
+          const preview = truncateForLog((payload as { text?: string }).text ?? "");
           log?.info?.(
             `Suppressing automatic agent_chat reply for message ${message.id}: ${preview}`,
           );
         },
         onError: (err, info) => {
-          log?.error?.(`${info.kind} reply failed: ${err}`);
+          log?.error?.(`${(info as { kind: string }).kind} reply failed: ${err}`);
+        },
+        metadata: {
+          sessionKey: ctxPayload.SessionKey,
+          runId: (cfg as { runId?: string }).runId,
+        },
+        run: async ({ dispatcher, replyOptions, markDispatchIdle }: { dispatcher: unknown; replyOptions: unknown; markDispatchIdle: () => void }) => {
+          await runtime.channel.reply.dispatchReplyFromConfig({
+            ctx: ctxPayload,
+            cfg,
+            dispatcher: dispatcher as any,
+            replyOptions: replyOptions as any,
+          });
+
+          markDispatchIdle();
+
+          log?.info?.(`✅ Successfully dispatched message ${message.id}`);
+          await markMessageRouted(client, message.id, dbUser);
         },
       });
-
-    // Dispatch the message to the agent using dispatchReplyFromConfig
-    log?.info?.(`🚀 Dispatching message ${message.id} to agent...`);
-
-    try {
-      await runtime.channel.reply.dispatchReplyFromConfig({
-        ctx: ctxPayload,
-        cfg,
-        dispatcher,
-        replyOptions,
-      });
-
-      markDispatchIdle();
-
-      log?.info?.(`✅ Successfully dispatched message ${message.id}`);
-      await markMessageRouted(client, message.id, dbUser);
-
-      // Wait for any async deliver() work to finish before returning.
-      await dispatcher.waitForIdle();
     } catch (dispatchError) {
       log?.error?.(`❌ Dispatch error for message ${message.id}: ${dispatchError}`);
       await markMessageFailed(
