@@ -5,6 +5,103 @@ All notable changes to the `agent-chat` message bus repository.
 ## [Unreleased]
 
 ### Added
+- **agent-chat#34/#36: alert-only pair breaker, peer mutes, explicit agent-facing
+  tools (no more auto-reply), and dispatch-identity resolution.**
+  - **No more automatic replies (agent-chat#36).** The plugin's reply dispatcher
+    no longer writes anything to the bus on its own. A turn's final text, an
+    empty turn, `NO_REPLY`/`ANNOUNCE_SKIP`, a fallback "no summary" string,
+    and any subagent/cron/heartbeat completion that runs inside an
+    `agent_chat` session are all dropped after a logged, truncated preview —
+    none of them reach `send_agent_message()`. The inbound context the
+    plugin builds carries no `OriginatingTo`, so there is no reply/announce
+    route back into `agent_chat` even for a completion that would otherwise
+    have one.
+  - **Three new agent-facing tools** (`plugin/src/tools.ts`, registered only
+    for non-sandboxed sessions so subagents never see them):
+    `agent_chat_send({ to, text, replyTo? })` (the only path to
+    `send_agent_message()` from a turn), `agent_chat_mark({ ids, status })`
+    (`handled`/`skipped` via `mark_agent_chat_status()`), and
+    `agent_chat_mute({ peer, minutes?, reason?, unmute? })`.
+  - **Per-peer sessions + wake line.** Each inbound message or breaker alert
+    now wakes a dedicated session keyed `agent:<self>:agent_chat:<peer>`
+    (`buildSessionLabel()`/`sanitizeSessionPeer()`), not one shared
+    `agent_chat` session. A synthetic wake line (`buildWakeLine()`) is
+    prepended to `Body` only — `RawBody`/`CommandBody` carry just the
+    peer's own text — spelling out that nothing is automatic and giving the
+    exact `agent_chat_send`/`agent_chat_mark` call shape to use.
+  - **Dispatch success alone no longer reaches a terminal status.** After a
+    successful dispatch the message is marked `routed`, full stop; reaching
+    `handled`/`skipped`/`responded` now requires an explicit
+    `agent_chat_mark` or `agent_chat_send({ replyTo })` call from the woken
+    turn. (This supersedes the agent-chat#23 dispatch-status auto-detection
+    logic — deliver()-fired → `responded`, no-reply-but-finished → `handled`,
+    `deferredToActiveRun` → stays `routed` — described in
+    `tests/TEST-CASES-ISSUE-23.md` Requirement 4, which predates this change
+    and is now historical only; see that file's new staleness note.)
+  - **Alert-only pair breaker** (`migrations/008-agent-chat-34-36-alert-only-breaker.sql`,
+    replacing agent-chat#11's suppression-based breaker from migration 005).
+    `agent_chat_breaker_state` moves from an ordered (sender, recipient) key
+    to an unordered `(pair_a, pair_b)` key — both directions of a
+    conversation count together. Threshold/window are configurable via the
+    new `agent_chat_breaker_config` table (global default 6 messages / 5
+    minutes, seeded by the migration; per-pair rows override it). Crossing
+    the threshold **never suppresses, pauses, or blocks delivery** — the
+    message is inserted normally and one alert per trip/window is recorded in
+    the new `agent_chat_breaker_alerts` table instead. The plugin polls
+    `agent_chat_pending_alerts(p_agent)` and injects each pending alert as a
+    loop-check wake into the agent's own per-peer session with that peer,
+    marking it seen via `agent_chat_mark_alerts_seen()` **only after the
+    injection dispatch succeeds** — a failed injection leaves `seen_at NULL`
+    and is retried on the next poll/NOTIFY rather than lost. The
+    content-novelty escape hatch and artifact-reference reset from the old
+    suppression breaker (`agent_chat_has_artifact_ref()`,
+    `agent_chat_message_shape()`, `escape_count`) are gone; the sender-side
+    runtime-error-template filter (`agent_chat_is_error_template()`) is
+    unchanged. `mark_agent_chat_status()` gained a new `skipped` status
+    option alongside `handled`/`expired`, and its return type changed from
+    `void` to `bigint[]` of the ids actually applied (backwards compatible
+    for callers that ignore the result).
+  - **Peer mutes.** New `agent_chat_mutes` table plus
+    `agent_chat_mute_peer(p_peer, p_minutes DEFAULT 60, p_reason)`,
+    `agent_chat_unmute_peer(p_peer)`, and `agent_chat_is_muted(p_agent, p_peer)`
+    — all `SECURITY DEFINER` owned by `postgres`, scoped by `session_user`,
+    following the same pattern as `send_agent_message()`. Muting a peer
+    suppresses only the inbound *wake* turn (the message is still stored and
+    claimed normally, so it stays visible in the muting agent's own startup
+    digest); muting sends exactly one system notice to the muted peer.
+  - **Dispatch identity resolution.** `resolveGatewayAgentId()` now resolves
+    the OpenClaw gateway agent id that owns `agent_chat` sessions
+    independently of the PostgreSQL role used for the bus connection:
+    explicit `channels.agent_chat.agentId` (or a per-account override) wins,
+    then the sole/default agent in `cfg.agents.entries`/`cfg.agents.list`,
+    then the DB role name as a backward-compatible fallback. The plugin
+    manifest (`plugin/openclaw.plugin.json`) now declares `agentId` in both
+    `channelConfigs.agent_chat.schema.properties` and
+    `configSchema.properties`. `install-plugin.sh` accepts
+    `AGENT_CHAT_AGENT_ID` (written to `channels.agent_chat.agentId`) and
+    `AGENT_CHAT_DB_NAME` (written to both the flat `agentChatDatabase` key
+    and the nested `agent_chat.database` key in `postgres.json`, kept in
+    sync).
+  - **Grants: no access by agent name, anywhere (agent-chat#39).**
+    `migrations/009-agent-chat-39-generic-grants.sql` discovers roles that
+    already hold bus access (via `information_schema.role_table_grants` /
+    `role_routine_grants`, quoting each discovered identifier exactly once
+    with `%I`) and dynamically re-applies the hardened standard grant set —
+    `SELECT` on `agent_chat`; `SELECT`/`INSERT`/`UPDATE` on
+    `agent_chat_processed`; `SELECT`-only on the breaker/mute control
+    tables — to each of them, with no role ever named in SQL.
+    `register-agent.sh` remains the only per-agent provisioning path and
+    still grants no direct DML on `agent_chat` itself. `EXECUTE` on every
+    `SECURITY DEFINER` function (including the new mute/alert functions)
+    continues to go through `PUBLIC`, which is safe because each function
+    validates the caller against `session_user` internally. `install.sh`
+    continues to require a PostgreSQL superuser (or the `postgres` role) to
+    apply the owner-assignment `DO` blocks.
+  - Schema version bumps to `9` (the highest numeric migration-file prefix);
+    `install.sh`'s `_get_expected_version` derives this automatically, so no
+    installer code changed for the bump.
+
+### Added
 - **agent-chat#23: OpenClaw 2026.9.x compatibility, accurate dispatch statuses, reply-to authorization, startup digest.**
   One plugin build now runs on both OLD (OpenClaw 2026.7.x, build `436c9a3`) and
   NEW (OpenClaw 2026.9.x, build `d6c4379`) gateways:
