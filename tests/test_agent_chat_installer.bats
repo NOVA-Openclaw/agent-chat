@@ -1514,6 +1514,112 @@ EOF
     rm -rf "$stub_dir"
 }
 
+# ─── config validation path correctness (TC-64/65) ──────────────────────────
+
+@test "TC-64: install-plugin.sh validates the exact config file when --openclaw-dir is not named .openclaw" {
+    local oc_dir="$FAKE_HOME/my-openclaw-config"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    echo '{}' > "$oc_dir/openclaw.json"
+    local expected_config="$oc_dir/openclaw.json"
+
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    cat > "$stub_dir/openclaw" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "config" ] && [ "\${2:-}" = "validate" ]; then
+  if [ "\${OPENCLAW_CONFIG_PATH:-}" != "$expected_config" ]; then
+    echo "stub openclaw: expected OPENCLAW_CONFIG_PATH=$expected_config, got \${OPENCLAW_CONFIG_PATH:-<unset>}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+echo "stub openclaw: unexpected args \$*" >&2
+exit 1
+EOF
+    chmod +x "$stub_dir/openclaw"
+    export PATH="$stub_dir:$PATH"
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OpenClaw config valid"* ]]
+
+    rm -rf "$stub_dir"
+}
+
+@test "TC-65: install-plugin.sh overrides inherited OPENCLAW_CONFIG_PATH during validation" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    echo '{}' > "$oc_dir/openclaw.json"
+    local expected_config="$oc_dir/openclaw.json"
+
+    local other_dir="$FAKE_HOME/other-config"
+    mkdir -p "$other_dir"
+    echo '{}' > "$other_dir/openclaw.json"
+
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    cat > "$stub_dir/openclaw" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "\${1:-}" = "config" ] && [ "\${2:-}" = "validate" ]; then
+  if [ "\${OPENCLAW_CONFIG_PATH:-}" != "$expected_config" ]; then
+    echo "stub openclaw: expected OPENCLAW_CONFIG_PATH=$expected_config, got \${OPENCLAW_CONFIG_PATH:-<unset>}" >&2
+    exit 1
+  fi
+  exit 0
+fi
+echo "stub openclaw: unexpected args \$*" >&2
+exit 1
+EOF
+    chmod +x "$stub_dir/openclaw"
+    export PATH="$stub_dir:$PATH"
+
+    OPENCLAW_CONFIG_PATH="$other_dir/openclaw.json" AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    echo "$output"
+    [ "$status" -eq 0 ]
+    [[ "$output" == *"OpenClaw config valid"* ]]
+
+    rm -rf "$stub_dir"
+}
+
+@test "TC-66: install-plugin.sh prunes openclaw.json backups to the newest 5 with mode 600" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    cat > "$oc_dir/openclaw.json" <<'EOF'
+{
+  "channels": {
+    "agent_chat": {
+      "pollIntervalMs": 100
+    }
+  }
+}
+EOF
+
+    # Pre-seed 7 backups with increasing timestamps.
+    local i
+    for i in 01 02 03 04 05 06 07; do
+        install -m 600 "$oc_dir/openclaw.json" "$oc_dir/openclaw.json.bak.20260101-12010$i"
+    done
+    [ "$(find "$oc_dir" -maxdepth 1 -name 'openclaw.json.bak.*' | wc -l)" -eq 7 ]
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    local backup_count
+    backup_count="$(find "$oc_dir" -maxdepth 1 -name 'openclaw.json.bak.*' | wc -l)"
+    [ "$backup_count" -eq 5 ]
+
+    # No retained backup has looser permissions than 600.
+    local bad_perms
+    bad_perms="$(find "$oc_dir" -maxdepth 1 -name 'openclaw.json.bak.*' ! -perm 600)"
+    [ -z "$bad_perms" ]
+}
+
 # ─── Plugin build verification ──────────────────────────────────────────────
 
 @test "Plugin builds successfully in repo" {
