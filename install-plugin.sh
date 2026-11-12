@@ -320,6 +320,35 @@ _fix_plugin_main() {
   echo -e "  ${CHECK_MARK} Fixed openclaw.plugin.json main field"
 }
 
+# Validate openclaw.json with the OpenClaw CLI --------------------------------
+
+_validate_openclaw_config() {
+  local config_file="$1"
+
+  if ! command -v openclaw &>/dev/null; then
+    echo -e "  ${WARNING} openclaw not found on PATH; skipping config validation" >&2
+    return 0
+  fi
+
+  echo "Validating OpenClaw config..."
+  local oc_dir home_parent validate_output validate_status
+  oc_dir="$(cd "$(dirname "$config_file")" && pwd)"
+  home_parent="$(cd "$oc_dir/.." && pwd)"
+
+  validate_status=0
+  validate_output="$(HOME="$home_parent" openclaw config validate 2>&1)" || validate_status=$?
+
+  if [ "$validate_status" -eq 0 ]; then
+    echo -e "  ${CHECK_MARK} OpenClaw config valid"
+    return 0
+  fi
+
+  echo -e "  ${CROSS_MARK} OpenClaw config validation failed; restoring backup" >&2
+  printf '%s\n' "$validate_output" >&2
+  _restore_file "$config_file"
+  return 1
+}
+
 # Read password from .pgpass for the target agent -----------------------------
 
 _read_password_from_pgpass() {
@@ -395,6 +424,11 @@ main() {
   else
     echo -e "  ${CROSS_MARK} Failed to update ${OPENCLAW_CONFIG}" >&2
     _restore_file "$OPENCLAW_CONFIG"
+    exit 1
+  fi
+
+  # Final safety net: validate with the OpenClaw CLI and roll back on failure.
+  if ! _validate_openclaw_config "$OPENCLAW_CONFIG"; then
     exit 1
   fi
 

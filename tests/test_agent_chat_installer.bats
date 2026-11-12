@@ -1447,6 +1447,73 @@ EOF
     [ "$(jq -r '.main' "$oc_dir/extensions/agent_chat/openclaw.plugin.json")" = "./dist/index.js" ]
 }
 
+@test "TC-62: install-plugin.sh strips legacy channels.agent_chat.enabled key" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    cat > "$oc_dir/openclaw.json" <<'EOF'
+{
+  "channels": {
+    "agent_chat": {
+      "enabled": true,
+      "pollIntervalMs": 500
+    }
+  }
+}
+EOF
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -eq 0 ]
+
+    # The legacy 'enabled' key (rejected by the plugin schema) must be removed.
+    [ "$(jq -r '.channels.agent_chat.enabled' "$oc_dir/openclaw.json")" = "null" ]
+    # Other preserved keys should survive.
+    [ "$(jq -r '.channels.agent_chat.pollIntervalMs' "$oc_dir/openclaw.json")" = "500" ]
+}
+
+@test "TC-63: install-plugin.sh restores openclaw.json and exits non-zero when config validation fails" {
+    local oc_dir="$FAKE_HOME/.openclaw"
+    mkdir -p "$oc_dir"
+    echo '{}' > "$oc_dir/postgres.json"
+    cat > "$oc_dir/openclaw.json" <<'EOF'
+{
+  "channels": {
+    "agent_chat": {
+      "enabled": true
+    }
+  }
+}
+EOF
+
+    # Snapshot the original config so we can prove restoration.
+    local original
+    original="$(cat "$oc_dir/openclaw.json")"
+
+    # Stub openclaw on PATH so 'config validate' exits 1.
+    local stub_dir
+    stub_dir="$(mktemp -d)"
+    cat > "$stub_dir/openclaw" <<'EOF'
+#!/usr/bin/env bash
+if [ "${1:-}" = "config" ] && [ "${2:-}" = "validate" ]; then
+    echo "stub openclaw: forced validation failure" >&2
+    exit 1
+fi
+# passthrough for any other openclaw invocation (none expected)
+exec /home/nova/.openclaw/tmp/agent-cli/openclaw "$@"
+EOF
+    chmod +x "$stub_dir/openclaw"
+    export PATH="$stub_dir:$PATH"
+
+    AGENT_CHAT_DB_NAME="agent_chat" run "$PLUGIN_INSTALLER" --openclaw-dir "$oc_dir" --agent-name "testagent" --password "***"
+    [ "$status" -ne 0 ]
+    [[ "$output" == *"config validation failed"* ]]
+
+    # openclaw.json must be restored to its pre-install content.
+    [ "$(cat "$oc_dir/openclaw.json")" = "$original" ]
+
+    rm -rf "$stub_dir"
+}
+
 # ─── Plugin build verification ──────────────────────────────────────────────
 
 @test "Plugin builds successfully in repo" {

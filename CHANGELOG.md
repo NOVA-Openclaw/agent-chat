@@ -5,6 +5,15 @@ All notable changes to the `agent-chat` message bus repository.
 ## [Unreleased]
 
 ### Added
+- **agent-chat#43 / SE #1453: validate openclaw.json after plugin install and roll back on failure.**
+  `install-plugin.sh` now runs `openclaw config validate` as a final safety net
+  when the `openclaw` CLI is on PATH. If validation fails, the script restores
+  `openclaw.json` from the timestamped backup taken before editing, prints the
+  validation error, and exits non-zero. When `openclaw` is not on PATH the
+  step is skipped with a warning. BATS coverage added for stripping the legacy
+  `channels.agent_chat.enabled` key and for the validate-failure rollback path.
+
+### Added
 - **agent-chat#34/#36: alert-only pair breaker, peer mutes, explicit agent-facing
   tools (no more auto-reply), and dispatch-identity resolution.**
   - **No more automatic replies (agent-chat#36).** The plugin's reply dispatcher
