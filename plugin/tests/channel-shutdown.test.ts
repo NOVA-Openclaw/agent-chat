@@ -67,6 +67,7 @@ class FakeClient extends EventEmitter {
   ended = false;
   destroyed = false;
   endDelay = 30;
+  events?: string[];
   private endHangs = false;
   private blockAll = false;
   private deferred?: {
@@ -90,6 +91,7 @@ class FakeClient extends EventEmitter {
   }
 
   async end() {
+    this.events?.push("end-called");
     if (this.endHangs) {
       return new Promise<void>(() => {});
     }
@@ -195,41 +197,71 @@ describe("SE#1475: startAgentChatMonitor shutdown", () => {
     );
   });
 
-  it("awaits an in-flight notification handler before resolving", async () => {
-    const client = new FakeClient();
-    const controller = new AbortController();
-    const promise = startAgentChatMonitor(makeCtx(controller.signal), client as any);
+  it(
+    "awaits an in-flight notification handler before resolving",
+    { timeout: 5000 },
+    async () => {
+      const events: string[] = [];
+      const client = new FakeClient();
+      client.events = events;
 
-    await wait(15);
-    client.block();
-    client.emit("notification", {
-      channel: "agent_chat_breaker_alert",
-    } as FakeNotification);
-    await wait(10);
+      // Spy on the pending-alerts query so the test observes exactly when the
+      // in-flight notification handler finishes its work.
+      let recordHandlerDone = false;
+      const originalQuery = client.query.bind(client);
+      client.query = async function query(sql: string, params?: unknown[]) {
+        const result = await originalQuery(sql, params);
+        if (recordHandlerDone && /agent_chat_pending_alerts/i.test(sql)) {
+          events.push("handler-done");
+        }
+        return result;
+      };
 
-    assert.ok(
-      client.queries.some((q) => /agent_chat_pending_alerts/i.test(q)),
-      "handler should have issued the pending-alerts query",
-    );
+      const controller = new AbortController();
+      const promise = startAgentChatMonitor(makeCtx(controller.signal), client as any);
 
-    controller.abort();
-    await wait(15);
+      await wait(15);
 
-    assert.strictEqual(
-      client.ended,
-      false,
-      "client must not be closed while a handler is still in flight",
-    );
+      // Start a handler and block it inside the pending-alerts query.
+      recordHandlerDone = true;
+      client.block();
+      client.emit("notification", {
+        channel: "agent_chat_breaker_alert",
+      } as FakeNotification);
+      await wait(10);
 
-    client.unblock();
-    await promise;
+      assert.ok(
+        client.queries.some((q) => /agent_chat_pending_alerts/i.test(q)),
+        "handler should have issued the pending-alerts query",
+      );
 
-    assert.strictEqual(
-      client.ended,
-      true,
-      "client must be closed after the in-flight handler settles",
-    );
-  });
+      controller.abort();
+
+      // Give a non-blocking cleanup implementation enough time to reach
+      // client.end(). With the correct code cleanup is parked awaiting the
+      // blocked handler, so "end-called" must not appear yet.
+      await wait(50);
+
+      // If cleanup() stopped awaiting in-flight handlers, client.end() would
+      // already have been invoked and the event log would contain "end-called".
+      assert.deepStrictEqual(
+        events.filter((e) => e === "end-called"),
+        [],
+        "client.end() must not be called while a handler is still in flight",
+      );
+
+      // Unblock the handler. The correct implementation waits for the handler
+      // to settle before calling client.end().
+      client.unblock();
+      await promise;
+
+      assert.deepStrictEqual(
+        events,
+        ["handler-done", "end-called"],
+        "handler must finish before client.end() is called",
+      );
+    },
+  );
 
   it("ignores notifications that arrive after abort", async () => {
     const client = new FakeClient();
