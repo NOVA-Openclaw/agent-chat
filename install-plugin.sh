@@ -126,6 +126,11 @@ _backup_file() {
   local file="$1"
   if [ -f "$file" ]; then
     install -m 600 "$file" "$file.bak.$(date +%Y%m%d-%H%M%S)"
+    # Keep only the 5 newest backups for this file; mode stays 600 from install above.
+    local old_backup
+    while IFS= read -r old_backup; do
+      [ -n "$old_backup" ] && rm -f "$old_backup"
+    done < <(find "$(dirname "$file")" -maxdepth 1 -type f -name "$(basename "$file").bak.*" -printf '%T@ %p\n' 2>/dev/null | sort -nr | tail -n +6 | cut -d' ' -f2-)
   fi
 }
 
@@ -320,6 +325,41 @@ _fix_plugin_main() {
   echo -e "  ${CHECK_MARK} Fixed openclaw.plugin.json main field"
 }
 
+# Validate openclaw.json with the OpenClaw CLI --------------------------------
+
+_validate_openclaw_config() {
+  local config_file="$1"
+
+  if ! command -v openclaw &>/dev/null; then
+    echo -e "  ${WARNING} openclaw not found on PATH; skipping config validation" >&2
+    return 0
+  fi
+
+  # Make the target path absolute so OPENCLAW_CONFIG_PATH resolves to the
+  # file we just wrote, regardless of the caller's cwd.  The real CLI reads
+  # OPENCLAW_CONFIG_PATH before OPENCLAW_STATE_DIR and HOME (see
+  # resolveLauncherConfigPaths in openclaw.mjs), so override any inherited
+  # value instead of rewriting HOME, which only works for ~/.openclaw dirs.
+  local oc_dir
+  oc_dir="$(cd "$(dirname "$config_file")" && pwd)"
+  config_file="$oc_dir/$(basename "$config_file")"
+
+  echo "Validating OpenClaw config..."
+  local validate_output validate_status
+  validate_status=0
+  validate_output="$(OPENCLAW_CONFIG_PATH="$config_file" OPENCLAW_STATE_DIR="" openclaw config validate 2>&1)" || validate_status=$?
+
+  if [ "$validate_status" -eq 0 ]; then
+    echo -e "  ${CHECK_MARK} OpenClaw config valid"
+    return 0
+  fi
+
+  echo -e "  ${CROSS_MARK} OpenClaw config validation failed; restoring backup" >&2
+  printf '%s\n' "$validate_output" >&2
+  _restore_file "$config_file"
+  return 1
+}
+
 # Read password from .pgpass for the target agent -----------------------------
 
 _read_password_from_pgpass() {
@@ -395,6 +435,11 @@ main() {
   else
     echo -e "  ${CROSS_MARK} Failed to update ${OPENCLAW_CONFIG}" >&2
     _restore_file "$OPENCLAW_CONFIG"
+    exit 1
+  fi
+
+  # Final safety net: validate with the OpenClaw CLI and roll back on failure.
+  if ! _validate_openclaw_config "$OPENCLAW_CONFIG"; then
     exit 1
   fi
 
