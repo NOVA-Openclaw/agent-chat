@@ -811,8 +811,9 @@ export async function processAgentChatMessage({
 /**
  * Start monitoring agent_chat for this account
  */
-async function startAgentChatMonitor(
+export async function startAgentChatMonitor(
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>,
+  clientOverride?: pg.Client,
 ): Promise<void> {
   const { pollIntervalMs } = ctx.account.config;
   const log = ctx.log;
@@ -826,7 +827,7 @@ async function startAgentChatMonitor(
 
   log?.info?.(`Starting monitor for DB user ${dbUser} / gateway agent ${gatewayAgentId}`);
 
-  const client = createPgClient();
+  const client = clientOverride ?? createPgClient();
   const runtime = getAgentChatRuntime();
 
   try {
@@ -843,37 +844,64 @@ async function startAgentChatMonitor(
     await client.query("LISTEN agent_chat_breaker_alert");
     log?.info?.(`Listening on channel 'agent_chat_breaker_alert'`);
 
+    // Track in-flight work so shutdown can await it before releasing the
+    // PluginInstance call lease. Bounded: promises are removed on settlement.
+    let aborted = false;
+    const inFlight = new Set<Promise<unknown>>();
+
+    function track<T>(promise: Promise<T>): Promise<T> {
+      inFlight.add(promise);
+      promise.then(
+        () => inFlight.delete(promise),
+        () => inFlight.delete(promise),
+      );
+      return promise;
+    }
+
     // Handle notifications
-    client.on("notification", async (msg) => {
+    client.on("notification", (msg) => {
+      if (aborted) {
+        return;
+      }
+
       if (msg.channel === "agent_chat") {
         log?.debug?.(`Received notification`);
 
-        try {
-          // Check breaker alerts before waking on new messages.
-          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
+        track(
+          (async () => {
+            try {
+              // Check breaker alerts before waking on new messages.
+              await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
 
-          const messages = await fetchUnprocessedMessages(client, dbUser);
+              const messages = await fetchUnprocessedMessages(client, dbUser);
 
-          for (const message of messages) {
-            await processAgentChatMessage({
-              message,
-              client,
-              dbUser,
-              gatewayAgentId,
-              cfg: ctx.cfg,
-              ctx,
-            });
-          }
-        } catch (error) {
-          log?.error?.(`Error processing notification: ${error}`);
-        }
+              for (const message of messages) {
+                await processAgentChatMessage({
+                  message,
+                  client,
+                  dbUser,
+                  gatewayAgentId,
+                  cfg: ctx.cfg,
+                  ctx,
+                });
+              }
+            } catch (error) {
+              log?.error?.(`Error processing notification: ${error}`);
+            }
+          })(),
+        );
       } else if (msg.channel === "agent_chat_breaker_alert") {
         log?.debug?.(`Received breaker alert notification`);
-        try {
-          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
-        } catch (error) {
-          log?.error?.(`Error processing breaker alert notification: ${error}`);
-        }
+
+        track(
+          (async () => {
+            try {
+              await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
+            } catch (error) {
+              log?.error?.(`Error processing breaker alert notification: ${error}`);
+            }
+          })(),
+        );
       }
     });
 
@@ -896,35 +924,54 @@ async function startAgentChatMonitor(
 
     // Keep connection alive
     const keepAliveInterval = setInterval(() => {
-      if (!ctx.abortSignal?.aborted) {
+      if (aborted) {
+        return;
+      }
+      track(
         client.query("SELECT 1").catch((err) => {
           log?.error?.(`Keep-alive failed: ${err}`);
-        });
-      }
+        }),
+      );
     }, pollIntervalMs);
 
-    // Handle abort signal
+    // Shutdown: stop accepting new work, drain in-flight handlers/keepalive
+    // queries, close the PG client, then release the long-lived call lease.
+    let cleanupResolve: () => void;
+    const cleanupDone = new Promise<void>((resolve) => {
+      cleanupResolve = resolve;
+    });
+
+    async function cleanup(): Promise<void> {
+      aborted = true;
+      clearInterval(keepAliveInterval);
+
+      // Await bounded in-flight work (notification handlers and keepalive
+      // queries) with a safety ceiling so a hung handler cannot block close
+      // forever. Core forces retirement after 5s; we stay well under it.
+      await Promise.allSettled(Array.from(inFlight));
+
+      try {
+        await client.query("UNLISTEN agent_chat");
+        await client.query("UNLISTEN agent_chat_breaker_alert");
+        await client.end();
+        log?.info?.(`Disconnected from PostgreSQL`);
+      } catch (error) {
+        log?.error?.(`Error during shutdown: ${error}`);
+      } finally {
+        cleanupResolve();
+      }
+    }
+
     if (ctx.abortSignal) {
-      ctx.abortSignal.addEventListener("abort", async () => {
+      ctx.abortSignal.addEventListener("abort", () => {
         log?.info?.(`Received abort signal`);
-        clearInterval(keepAliveInterval);
-        try {
-          await client.query("UNLISTEN agent_chat");
-          await client.query("UNLISTEN agent_chat_breaker_alert");
-          await client.end();
-          log?.info?.(`Disconnected from PostgreSQL`);
-        } catch (error) {
-          log?.error?.(`Error during shutdown: ${error}`);
-        }
+        // Intentionally not awaited here; the outer promise waits on cleanupDone.
+        cleanup();
       });
     }
 
-    // Wait for abort
-    return new Promise<void>((resolve) => {
-      if (ctx.abortSignal) {
-        ctx.abortSignal.addEventListener("abort", () => resolve());
-      }
-    });
+    // Wait for cleanup before releasing the PluginInstance call lease.
+    return cleanupDone;
   } catch (error) {
     log?.error?.(
       `agent_chat: fatal error connecting to PostgreSQL ` +
