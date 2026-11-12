@@ -811,8 +811,9 @@ export async function processAgentChatMessage({
 /**
  * Start monitoring agent_chat for this account
  */
-async function startAgentChatMonitor(
+export async function startAgentChatMonitor(
   ctx: ChannelGatewayContext<ResolvedAgentChatAccount>,
+  clientOverride?: pg.Client,
 ): Promise<void> {
   const { pollIntervalMs } = ctx.account.config;
   const log = ctx.log;
@@ -826,7 +827,7 @@ async function startAgentChatMonitor(
 
   log?.info?.(`Starting monitor for DB user ${dbUser} / gateway agent ${gatewayAgentId}`);
 
-  const client = createPgClient();
+  const client = clientOverride ?? createPgClient();
   const runtime = getAgentChatRuntime();
 
   try {
@@ -843,37 +844,66 @@ async function startAgentChatMonitor(
     await client.query("LISTEN agent_chat_breaker_alert");
     log?.info?.(`Listening on channel 'agent_chat_breaker_alert'`);
 
+    // Track in-flight work so shutdown can await it before releasing the
+    // PluginInstance call lease. Bounded: promises are removed on settlement.
+    let aborted = false;
+    const inFlight = new Map<Promise<unknown>, string>();
+
+    function track<T>(promise: Promise<T>, description = "unnamed work"): Promise<T> {
+      inFlight.set(promise, description);
+      promise.then(
+        () => inFlight.delete(promise),
+        () => inFlight.delete(promise),
+      );
+      return promise;
+    }
+
     // Handle notifications
-    client.on("notification", async (msg) => {
+    client.on("notification", (msg) => {
+      if (aborted) {
+        return;
+      }
+
       if (msg.channel === "agent_chat") {
         log?.debug?.(`Received notification`);
 
-        try {
-          // Check breaker alerts before waking on new messages.
-          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
+        track(
+          (async () => {
+            try {
+              // Check breaker alerts before waking on new messages.
+              await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
 
-          const messages = await fetchUnprocessedMessages(client, dbUser);
+              const messages = await fetchUnprocessedMessages(client, dbUser);
 
-          for (const message of messages) {
-            await processAgentChatMessage({
-              message,
-              client,
-              dbUser,
-              gatewayAgentId,
-              cfg: ctx.cfg,
-              ctx,
-            });
-          }
-        } catch (error) {
-          log?.error?.(`Error processing notification: ${error}`);
-        }
+              for (const message of messages) {
+                await processAgentChatMessage({
+                  message,
+                  client,
+                  dbUser,
+                  gatewayAgentId,
+                  cfg: ctx.cfg,
+                  ctx,
+                });
+              }
+            } catch (error) {
+              log?.error?.(`Error processing notification: ${error}`);
+            }
+          })(),
+          "agent_chat notification handler",
+        );
       } else if (msg.channel === "agent_chat_breaker_alert") {
         log?.debug?.(`Received breaker alert notification`);
-        try {
-          await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
-        } catch (error) {
-          log?.error?.(`Error processing breaker alert notification: ${error}`);
-        }
+
+        track(
+          (async () => {
+            try {
+              await checkPendingAlerts(client, dbUser, ctx.cfg, ctx, runtime);
+            } catch (error) {
+              log?.error?.(`Error processing breaker alert notification: ${error}`);
+            }
+          })(),
+          "breaker alert notification handler",
+        );
       }
     });
 
@@ -896,35 +926,121 @@ async function startAgentChatMonitor(
 
     // Keep connection alive
     const keepAliveInterval = setInterval(() => {
-      if (!ctx.abortSignal?.aborted) {
+      if (aborted) {
+        return;
+      }
+      track(
         client.query("SELECT 1").catch((err) => {
           log?.error?.(`Keep-alive failed: ${err}`);
-        });
-      }
+        }),
+        "keepalive query",
+      );
     }, pollIntervalMs);
 
-    // Handle abort signal
-    if (ctx.abortSignal) {
-      ctx.abortSignal.addEventListener("abort", async () => {
-        log?.info?.(`Received abort signal`);
-        clearInterval(keepAliveInterval);
+    // Shutdown: stop accepting new work, drain in-flight handlers/keepalive
+    // queries, close the PG client, then release the long-lived call lease.
+    const SHUTDOWN_DEADLINE_MS = 3000;
+    const HANDLER_BUDGET_MS = 1500;
+
+    let cleanupResolve: () => void;
+    const cleanupDone = new Promise<void>((resolve) => {
+      cleanupResolve = resolve;
+    });
+
+    function forceCloseClient(connectionClient: pg.Client): void {
+      try {
+        const stream = (connectionClient as unknown as { connection?: { stream?: { destroy?: () => void } } })
+          .connection?.stream;
+        if (typeof stream?.destroy === "function") {
+          stream.destroy();
+          log?.info?.(`Forced PostgreSQL connection closed`);
+        }
+      } catch (error) {
+        log?.error?.(`Error force-closing connection: ${error}`);
+      }
+    }
+
+    async function cleanup(): Promise<void> {
+      aborted = true;
+      clearInterval(keepAliveInterval);
+
+      const deadline = Date.now() + SHUTDOWN_DEADLINE_MS;
+
+      // Drain in-flight handlers with a bounded budget. A handler mid
+      // agent-turn dispatch can run for minutes, so we cap the wait and
+      // abandon any stragglers. Core forces retirement after 5s; we stay
+      // well under it.
+      const inFlightSnapshot = Array.from(inFlight.entries());
+      if (inFlightSnapshot.length > 0) {
+        let handlerTimer: ReturnType<typeof setTimeout> | undefined;
+        const handlerResult = await Promise.race([
+          Promise.allSettled(inFlightSnapshot.map(([promise]) => promise)),
+          new Promise<"handler-timeout">((resolve) => {
+            handlerTimer = setTimeout(resolve, HANDLER_BUDGET_MS, "handler-timeout");
+          }),
+        ]);
+        if (handlerTimer) {
+          clearTimeout(handlerTimer);
+        }
+        if (handlerResult === "handler-timeout") {
+          const abandoned = Array.from(inFlight.values());
+          log?.error?.(
+            `Shutdown timeout waiting for in-flight handlers; abandoning ${abandoned.length} pending task(s): ${abandoned.join(", ")}`,
+          );
+        }
+      }
+
+      // Close the PG client with whatever budget remains. If client.end()
+      // hangs on a dead connection, force-close the underlying stream so
+      // the lease resolves instead of waiting for core's forced retirement.
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        log?.error?.(`Shutdown budget exhausted; force-closing PostgreSQL connection`);
+        forceCloseClient(client);
+      } else {
+        let closeTimer: ReturnType<typeof setTimeout> | undefined;
         try {
-          await client.query("UNLISTEN agent_chat");
-          await client.query("UNLISTEN agent_chat_breaker_alert");
-          await client.end();
-          log?.info?.(`Disconnected from PostgreSQL`);
+          const closeResult = await Promise.race([
+            (async () => {
+              await client.query("UNLISTEN agent_chat");
+              await client.query("UNLISTEN agent_chat_breaker_alert");
+              await client.end();
+            })(),
+            new Promise<"close-timeout">((resolve) => {
+              closeTimer = setTimeout(resolve, remainingMs, "close-timeout");
+            }),
+          ]);
+          if (closeTimer) {
+            clearTimeout(closeTimer);
+          }
+          if (closeResult === "close-timeout") {
+            log?.error?.(`Shutdown timeout waiting for client.end(); force-closing PostgreSQL connection`);
+            forceCloseClient(client);
+          } else {
+            log?.info?.(`Disconnected from PostgreSQL`);
+          }
         } catch (error) {
           log?.error?.(`Error during shutdown: ${error}`);
+          forceCloseClient(client);
+          if (closeTimer) {
+            clearTimeout(closeTimer);
+          }
         }
+      }
+
+      cleanupResolve();
+    }
+
+    if (ctx.abortSignal) {
+      ctx.abortSignal.addEventListener("abort", () => {
+        log?.info?.(`Received abort signal`);
+        // Intentionally not awaited here; the outer promise waits on cleanupDone.
+        cleanup();
       });
     }
 
-    // Wait for abort
-    return new Promise<void>((resolve) => {
-      if (ctx.abortSignal) {
-        ctx.abortSignal.addEventListener("abort", () => resolve());
-      }
-    });
+    // Wait for cleanup before releasing the PluginInstance call lease.
+    return cleanupDone;
   } catch (error) {
     log?.error?.(
       `agent_chat: fatal error connecting to PostgreSQL ` +
