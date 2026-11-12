@@ -847,10 +847,10 @@ export async function startAgentChatMonitor(
     // Track in-flight work so shutdown can await it before releasing the
     // PluginInstance call lease. Bounded: promises are removed on settlement.
     let aborted = false;
-    const inFlight = new Set<Promise<unknown>>();
+    const inFlight = new Map<Promise<unknown>, string>();
 
-    function track<T>(promise: Promise<T>): Promise<T> {
-      inFlight.add(promise);
+    function track<T>(promise: Promise<T>, description = "unnamed work"): Promise<T> {
+      inFlight.set(promise, description);
       promise.then(
         () => inFlight.delete(promise),
         () => inFlight.delete(promise),
@@ -889,6 +889,7 @@ export async function startAgentChatMonitor(
               log?.error?.(`Error processing notification: ${error}`);
             }
           })(),
+          "agent_chat notification handler",
         );
       } else if (msg.channel === "agent_chat_breaker_alert") {
         log?.debug?.(`Received breaker alert notification`);
@@ -901,6 +902,7 @@ export async function startAgentChatMonitor(
               log?.error?.(`Error processing breaker alert notification: ${error}`);
             }
           })(),
+          "breaker alert notification handler",
         );
       }
     });
@@ -931,35 +933,102 @@ export async function startAgentChatMonitor(
         client.query("SELECT 1").catch((err) => {
           log?.error?.(`Keep-alive failed: ${err}`);
         }),
+        "keepalive query",
       );
     }, pollIntervalMs);
 
     // Shutdown: stop accepting new work, drain in-flight handlers/keepalive
     // queries, close the PG client, then release the long-lived call lease.
+    const SHUTDOWN_DEADLINE_MS = 3000;
+    const HANDLER_BUDGET_MS = 1500;
+
     let cleanupResolve: () => void;
     const cleanupDone = new Promise<void>((resolve) => {
       cleanupResolve = resolve;
     });
 
+    function forceCloseClient(connectionClient: pg.Client): void {
+      try {
+        const stream = (connectionClient as unknown as { connection?: { stream?: { destroy?: () => void } } })
+          .connection?.stream;
+        if (typeof stream?.destroy === "function") {
+          stream.destroy();
+          log?.info?.(`Forced PostgreSQL connection closed`);
+        }
+      } catch (error) {
+        log?.error?.(`Error force-closing connection: ${error}`);
+      }
+    }
+
     async function cleanup(): Promise<void> {
       aborted = true;
       clearInterval(keepAliveInterval);
 
-      // Await bounded in-flight work (notification handlers and keepalive
-      // queries) with a safety ceiling so a hung handler cannot block close
-      // forever. Core forces retirement after 5s; we stay well under it.
-      await Promise.allSettled(Array.from(inFlight));
+      const deadline = Date.now() + SHUTDOWN_DEADLINE_MS;
 
-      try {
-        await client.query("UNLISTEN agent_chat");
-        await client.query("UNLISTEN agent_chat_breaker_alert");
-        await client.end();
-        log?.info?.(`Disconnected from PostgreSQL`);
-      } catch (error) {
-        log?.error?.(`Error during shutdown: ${error}`);
-      } finally {
-        cleanupResolve();
+      // Drain in-flight handlers with a bounded budget. A handler mid
+      // agent-turn dispatch can run for minutes, so we cap the wait and
+      // abandon any stragglers. Core forces retirement after 5s; we stay
+      // well under it.
+      const inFlightSnapshot = Array.from(inFlight.entries());
+      if (inFlightSnapshot.length > 0) {
+        let handlerTimer: ReturnType<typeof setTimeout> | undefined;
+        const handlerResult = await Promise.race([
+          Promise.allSettled(inFlightSnapshot.map(([promise]) => promise)),
+          new Promise<"handler-timeout">((resolve) => {
+            handlerTimer = setTimeout(resolve, HANDLER_BUDGET_MS, "handler-timeout");
+          }),
+        ]);
+        if (handlerTimer) {
+          clearTimeout(handlerTimer);
+        }
+        if (handlerResult === "handler-timeout") {
+          const abandoned = Array.from(inFlight.values());
+          log?.error?.(
+            `Shutdown timeout waiting for in-flight handlers; abandoning ${abandoned.length} pending task(s): ${abandoned.join(", ")}`,
+          );
+        }
       }
+
+      // Close the PG client with whatever budget remains. If client.end()
+      // hangs on a dead connection, force-close the underlying stream so
+      // the lease resolves instead of waiting for core's forced retirement.
+      const remainingMs = deadline - Date.now();
+      if (remainingMs <= 0) {
+        log?.error?.(`Shutdown budget exhausted; force-closing PostgreSQL connection`);
+        forceCloseClient(client);
+      } else {
+        let closeTimer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const closeResult = await Promise.race([
+            (async () => {
+              await client.query("UNLISTEN agent_chat");
+              await client.query("UNLISTEN agent_chat_breaker_alert");
+              await client.end();
+            })(),
+            new Promise<"close-timeout">((resolve) => {
+              closeTimer = setTimeout(resolve, remainingMs, "close-timeout");
+            }),
+          ]);
+          if (closeTimer) {
+            clearTimeout(closeTimer);
+          }
+          if (closeResult === "close-timeout") {
+            log?.error?.(`Shutdown timeout waiting for client.end(); force-closing PostgreSQL connection`);
+            forceCloseClient(client);
+          } else {
+            log?.info?.(`Disconnected from PostgreSQL`);
+          }
+        } catch (error) {
+          log?.error?.(`Error during shutdown: ${error}`);
+          forceCloseClient(client);
+          if (closeTimer) {
+            clearTimeout(closeTimer);
+          }
+        }
+      }
+
+      cleanupResolve();
     }
 
     if (ctx.abortSignal) {

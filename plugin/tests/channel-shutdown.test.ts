@@ -65,7 +65,9 @@ interface FakeNotification {
 class FakeClient extends EventEmitter {
   queries: string[] = [];
   ended = false;
+  destroyed = false;
   endDelay = 30;
+  private endHangs = false;
   private blockAll = false;
   private deferred?: {
     resolve(value: unknown): void;
@@ -73,11 +75,24 @@ class FakeClient extends EventEmitter {
     sql: string;
   };
 
+  // Expose a connection stream so forceCloseClient() can destroy it.
+  connection = {
+    stream: {
+      destroy: () => {
+        this.destroyed = true;
+        this.ended = true;
+      },
+    },
+  };
+
   connect() {
     return Promise.resolve();
   }
 
   async end() {
+    if (this.endHangs) {
+      return new Promise<void>(() => {});
+    }
     await new Promise((resolve) => setTimeout(resolve, this.endDelay));
     this.ended = true;
   }
@@ -134,6 +149,10 @@ class FakeClient extends EventEmitter {
       d.resolve({ rows: [] });
       this.deferred = undefined;
     }
+  }
+
+  hangEnd() {
+    this.endHangs = true;
   }
 }
 
@@ -262,5 +281,60 @@ describe("SE#1475: startAgentChatMonitor shutdown", () => {
     );
 
     await promise;
+  });
+
+  it("resolves within 4s when a notification handler never settles", async () => {
+    const client = new FakeClient();
+    const controller = new AbortController();
+    const promise = startAgentChatMonitor(makeCtx(controller.signal), client as any);
+
+    await wait(15);
+    client.block();
+    client.emit("notification", { channel: "agent_chat" } as FakeNotification);
+    await wait(10);
+
+    assert.ok(
+      client.queries.some((q) => /agent_chat_pending_alerts/i.test(q)),
+      "handler should have started before abort",
+    );
+
+    const start = Date.now();
+    controller.abort();
+    await promise;
+    const elapsed = Date.now() - start;
+
+    assert.ok(
+      elapsed < 4000,
+      `monitor should resolve within 4s of abort, took ${elapsed}ms`,
+    );
+    assert.strictEqual(
+      client.ended,
+      true,
+      "client must be closed after shutdown timeout",
+    );
+  });
+
+  it("resolves within 4s and destroys the connection when client.end() hangs", async () => {
+    const client = new FakeClient();
+    client.hangEnd();
+    const controller = new AbortController();
+    const promise = startAgentChatMonitor(makeCtx(controller.signal), client as any);
+
+    await wait(15);
+
+    const start = Date.now();
+    controller.abort();
+    await promise;
+    const elapsed = Date.now() - start;
+
+    assert.ok(
+      elapsed < 4000,
+      `monitor should resolve within 4s of abort, took ${elapsed}ms`,
+    );
+    assert.strictEqual(
+      client.destroyed,
+      true,
+      "connection stream must be destroyed when client.end() hangs",
+    );
   });
 });
